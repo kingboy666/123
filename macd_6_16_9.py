@@ -35,18 +35,17 @@ class MACDStrategy:
             'password': passphrase,
             'sandbox': False,
             'enableRateLimit': True,
-            'timeout': 30000,  # 添加timeout参数，与main.py保持一致
         })
         self.exchange.set_sandbox_mode(False)  # 实盘模式，与main.py一致
         
         # 交易对配置 - 改为永续合约，与main.py一致
         self.symbols = ['FIL-USDT-SWAP', 'ZRO-USDT-SWAP', 'WIF-USDT-SWAP', 'WLD-USDT-SWAP']
-        self.leverage = 10  # 改为与main.py一致的默认杠杆10倍
+        self.leverage = 25  # 统一25倍杠杆
         self.timeframe = '15m'  # 15分钟图
         
         # MACD参数
-        self.fast_period = 6
-        self.slow_period = 16
+        self.fast_period = 8  # 改为与main.py一致的MACD参数
+        self.slow_period = 21
         self.signal_period = 9
         
         # 仓位配置
@@ -126,7 +125,7 @@ class MACDStrategy:
         
         return ema_values
     
-    def get_klines(self, symbol: str, limit: int = 100) -> List[Dict]:
+    def get_klines(self, symbol: str, limit: int = 100) -> List[Dict[str, Any]]:
         """
         获取K线数据
         
@@ -175,10 +174,10 @@ class MACDStrategy:
             for position in positions:
                 if position['symbol'] == symbol:
                     return {
-                        'size': float(position['contracts']),
-                        'side': position['side'],
-                        'entry_price': float(position['entryPrice']),
-                        'unrealized_pnl': float(position['unrealizedPnl'])
+                        'size': float(position.get('contracts', 0) or 0),
+                        'side': position.get('side', 'none'),
+                        'entry_price': float(position.get('entryPrice', 0) or 0),
+                        'unrealized_pnl': float(position.get('unrealizedPnl', 0) or 0)
                     }
             return {'size': 0, 'side': 'none', 'entry_price': 0, 'unrealized_pnl': 0}
         except Exception as e:
@@ -187,7 +186,7 @@ class MACDStrategy:
     
     def calculate_order_amount(self, symbol: str, price: float) -> float:
         """
-        计算下单金额（智能分配）
+        计算下单金额（平均分配）
         
         Args:
             symbol: 交易对
@@ -200,15 +199,8 @@ class MACDStrategy:
             balance = self.get_account_balance()
             total_amount = balance * self.position_percentage
             
-            # 智能分配：根据交易对波动性分配资金
-            volatility_weights = {
-                'FIL-USDT': 0.25,
-                'ZRO-USDT': 0.25, 
-                'WIF-USDT': 0.25,
-                'WLD-USDT': 0.25
-            }
-            
-            allocated_amount = total_amount * volatility_weights.get(symbol, 0.25)
+            # 平均分配到每个交易对
+            allocated_amount = total_amount / len(self.symbols)
             
             # 计算合约数量
             ticker = self.exchange.fetch_ticker(symbol)
@@ -217,7 +209,7 @@ class MACDStrategy:
             # 确保不低于最小下单金额
             order_amount = max(allocated_amount, min_order_value)
             
-            logger.info(f"{symbol}智能分配金额: {order_amount:.2f} USDT")
+            logger.info(f"{symbol}分配金额: {order_amount:.2f} USDT")
             return order_amount
             
         except Exception as e:
@@ -274,14 +266,26 @@ class MACDStrategy:
                 logger.info(f"{symbol}无持仓，无需平仓")
                 return True
             
-            # 反向平仓
+            # 获取当前价格
+            ticker = self.exchange.fetch_ticker(symbol)
+            current_price = ticker['last']
+            
+            # 计算合约数量
+            size = float(position.get('size', 0) or 0)
+            
+            # 反向平仓：多头平仓用sell，空头平仓用buy
             side = 'sell' if position.get('side') == 'long' else 'buy'
-            size = float(position.get('size', 0) or 0) if position.get('size') is not None else 0
-            entry_price = float(position.get('entry_price', 0) or 0) if position.get('entry_price') is not None else 0
-            amount = size * entry_price
             
-            return self.create_order(symbol, side, amount)
+            # 直接使用合约数量创建市价单
+            order = self.exchange.create_market_order(symbol, side, size)
             
+            if order['id']:
+                logger.info(f"成功平仓{symbol}，方向: {side}，数量: {size}")
+                return True
+            else:
+                logger.error(f"平仓{symbol}失败")
+                return False
+                
         except Exception as e:
             logger.error(f"平仓{symbol}失败: {e}")
             return False
