@@ -13,11 +13,7 @@ import time
 import logging
 from datetime import datetime
 import os
-from typing import Dict, List, Optional, Union
-from dotenv import load_dotenv
-
-# 加载环境变量
-load_dotenv()
+from typing import Dict, List, Optional, Union, Any
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -164,7 +160,7 @@ class MACDStrategy:
             logger.error(f"获取账户余额失败: {e}")
             return 0
     
-    def get_position(self, symbol: str) -> Dict[str, Union[float, str, None]]:
+    def get_position(self, symbol: str) -> Dict[str, Any]:
         """
         获取持仓信息
         
@@ -279,9 +275,9 @@ class MACDStrategy:
                 return True
             
             # 反向平仓
-            side = 'sell' if position['side'] == 'long' else 'buy'
-            size = float(position['size'] or 0)
-            entry_price = float(position['entry_price'] or 0)
+            side = 'sell' if position.get('side') == 'long' else 'buy'
+            size = float(position.get('size', 0) or 0) if position.get('size') is not None else 0
+            entry_price = float(position.get('entry_price', 0) or 0) if position.get('entry_price') is not None else 0
             amount = size * entry_price
             
             return self.create_order(symbol, side, amount)
@@ -407,12 +403,9 @@ class MACDStrategy:
 
 def main():
     """主函数"""
-    # 重新加载环境变量确保正确加载
-    load_dotenv(override=True)
-    
-    # 从环境变量获取API配置
+    # 直接从环境变量获取API配置（Railway会自动设置环境变量）
     api_key = os.getenv('OKX_API_KEY') or ""
-    secret = os.getenv('OKX_SECRET_KEY') or ""  # 改为与main.py一致
+    secret = os.getenv('OKX_SECRET_KEY') or ""
     passphrase = os.getenv('OKX_PASSPHRASE') or ""
     
     # 调试信息
