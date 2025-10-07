@@ -1,0 +1,12 @@
+{
+  "系统状态": "准备部署",
+  "Python版本": "3.13",
+  "工作目录": "C:\\Users\\Administrator\\Desktop\\新建文件夹",
+  "文件总数": 559,
+  "配置检查": {
+    "requirements.txt": true,
+    "Procfile": true,
+    "railway.json": true,
+    "main.py": true
+  }
+}
