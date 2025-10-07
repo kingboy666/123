@@ -403,10 +403,18 @@ class MACDStrategy:
 
 def main():
     """主函数"""
+    # 重新加载环境变量确保正确加载
+    load_dotenv('OKX.env', override=True)
+    
     # 从环境变量获取API配置
     api_key = os.getenv('OKX_API_KEY')
     secret = os.getenv('OKX_SECRET') 
     passphrase = os.getenv('OKX_PASSPHRASE')
+    
+    # 调试信息
+    logger.info(f"API_KEY: {api_key is not None}")
+    logger.info(f"SECRET: {secret is not None}") 
+    logger.info(f"PASSPHRASE: {passphrase is not None}")
     
     if not all([api_key, secret, passphrase]):
         logger.error("请设置OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE环境变量")
