@@ -13,7 +13,7 @@ import time
 import logging
 from datetime import datetime
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 from dotenv import load_dotenv
 
 # 加载环境变量
@@ -39,12 +39,13 @@ class MACDStrategy:
             'password': passphrase,
             'sandbox': False,
             'enableRateLimit': True,
+            'timeout': 30000,  # 添加timeout参数，与main.py保持一致
         })
         self.exchange.set_sandbox_mode(False)  # 实盘模式，与main.py一致
         
         # 交易对配置 - 改为永续合约，与main.py一致
         self.symbols = ['FIL-USDT-SWAP', 'ZRO-USDT-SWAP', 'WIF-USDT-SWAP', 'WLD-USDT-SWAP']
-        self.leverage = 20
+        self.leverage = 10  # 改为与main.py一致的默认杠杆10倍
         self.timeframe = '15m'  # 15分钟图
         
         # MACD参数
@@ -77,7 +78,7 @@ class MACDStrategy:
         except Exception as e:
             logger.error(f"交易所设置失败: {e}")
     
-    def calculate_macd(self, prices: List[float]) -> Dict:
+    def calculate_macd(self, prices: List[float]) -> Dict[str, float]:
         """
         计算MACD指标
         
@@ -163,7 +164,7 @@ class MACDStrategy:
             logger.error(f"获取账户余额失败: {e}")
             return 0
     
-    def get_position(self, symbol: str) -> Dict:
+    def get_position(self, symbol: str) -> Dict[str, Union[float, str, None]]:
         """
         获取持仓信息
         
@@ -279,7 +280,9 @@ class MACDStrategy:
             
             # 反向平仓
             side = 'sell' if position['side'] == 'long' else 'buy'
-            amount = position['size'] * position['entry_price']
+            size = float(position['size'] or 0)
+            entry_price = float(position['entry_price'] or 0)
+            amount = size * entry_price
             
             return self.create_order(symbol, side, amount)
             
@@ -287,7 +290,7 @@ class MACDStrategy:
             logger.error(f"平仓{symbol}失败: {e}")
             return False
     
-    def analyze_symbol(self, symbol: str) -> Dict:
+    def analyze_symbol(self, symbol: str) -> Dict[str, str]:
         """
         分析单个交易对
         
