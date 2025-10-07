@@ -40,20 +40,35 @@ class MACDStrategy:
         
         # 交易对配置 - 改为永续合约，与main.py一致
         self.symbols = ['FIL-USDT-SWAP', 'ZRO-USDT-SWAP', 'WIF-USDT-SWAP', 'WLD-USDT-SWAP']
-        self.leverage = 25  # 统一25倍杠杆
+        
+        # 杠杆配置 - 统一使用25倍杠杆，确保四个交易对都能做
+        self.max_leverage_btc = 25  # BTC最大杠杆25倍
+        self.max_leverage_eth = 25  # ETH最大杠杆25倍
+        self.max_leverage_major = 25  # 主流币最大杠杆25倍
+        self.max_leverage_others = 25  # 其他币种最大杠杆25倍
+        self.leverage_min = 25  # 最低杠杆25倍
+        
+        # 主流币种定义
+        self.major_coins = ['BNB', 'XRP', 'ADA', 'SOL', 'DOT', 'AVAX', 'DOGE']
+    
+    def get_smart_leverage(self, symbol: str, account_balance: float) -> int:
+        """根据币种和账户大小智能计算杠杆倍数 - 统一使用25倍"""
+        # 统一使用25倍杠杆，确保四个交易对都能做
+        return 25
+        
         self.timeframe = '15m'  # 15分钟图
         
-        # MACD参数
-        self.fast_period = 8  # 改为与main.py一致的MACD参数
+        # MACD参数 - 与main.py保持一致
+        self.fast_period = 8
         self.slow_period = 21
         self.signal_period = 9
         
         # 仓位配置
-        self.position_percentage = 0.8  # 使用80%余额
-        self.min_order_value = 1  # 最小下单金额1USDT
+        self.position_percentage: float = 0.8  # 使用80%余额
+        self.min_order_value: float = 1  # 最小下单金额1USDT
         
         # 持仓记录
-        self.positions = {}
+        self.positions: Dict[str, Any] = {}
         
         # 初始化交易所
         self._setup_exchange()
@@ -63,8 +78,10 @@ class MACDStrategy:
         try:
             # 设置杠杆
             for symbol in self.symbols:
-                self.exchange.set_leverage(self.leverage, symbol)
-                logger.info(f"设置{symbol}杠杆为{self.leverage}倍")
+                # 使用智能杠杆计算
+                smart_leverage = self.get_smart_leverage(symbol, 1000)  # 默认账户余额1000
+                self.exchange.set_leverage(smart_leverage, symbol)
+                logger.info(f"设置{symbol}杠杆为{smart_leverage}倍")
             
             # 设置合约模式
             self.exchange.set_position_mode(False)  # 单向持仓模式
@@ -154,10 +171,11 @@ class MACDStrategy:
         """获取账户余额"""
         try:
             balance = self.exchange.fetch_balance()
-            return float(balance['USDT']['free'])
+            usdt_balance = balance.get('USDT', {}).get('free', 0.0)
+            return float(usdt_balance) if usdt_balance is not None else 0.0
         except Exception as e:
             logger.error(f"获取账户余额失败: {e}")
-            return 0
+            return 0.0
     
     def get_position(self, symbol: str) -> Dict[str, Any]:
         """
@@ -204,7 +222,7 @@ class MACDStrategy:
             
             # 计算合约数量
             ticker = self.exchange.fetch_ticker(symbol)
-            min_order_value = ticker.get('info', {}).get('minOrderAmount', self.min_order_value)
+            min_order_value = float(ticker.get('info', {}).get('minOrderAmount', self.min_order_value))
             
             # 确保不低于最小下单金额
             order_amount = max(allocated_amount, min_order_value)
@@ -214,7 +232,7 @@ class MACDStrategy:
             
         except Exception as e:
             logger.error(f"计算{symbol}下单金额失败: {e}")
-            return self.min_order_value
+            return float(self.min_order_value)
     
     def create_order(self, symbol: str, side: str, amount: float) -> bool:
         """
@@ -231,7 +249,7 @@ class MACDStrategy:
         try:
             # 获取当前价格
             ticker = self.exchange.fetch_ticker(symbol)
-            current_price = ticker['last']
+            current_price = float(ticker['last'])
             
             # 计算合约数量
             contract_size = amount / current_price
