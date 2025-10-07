@@ -1,8 +1,0 @@
-=== MA50 + SAR 轻量策略回测报告 ===
-标的数量: 4
-周期: 7天
-
-FIL-USDT-SWAP: 错误: okx GET https://www.okx.com/api/v5/public/instruments?instType=SPOT
-ZRO-USDT-SWAP: 错误: okx GET https://www.okx.com/api/v5/public/instruments?instType=SPOT
-WIF-USDT-SWAP: 错误: okx GET https://www.okx.com/api/v5/public/instruments?instType=SPOT
-WLD-USDT-SWAP: 错误: okx GET https://www.okx.com/api/v5/public/instruments?instType=SPOT
