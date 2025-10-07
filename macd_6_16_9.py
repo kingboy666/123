@@ -14,6 +14,10 @@ import logging
 from datetime import datetime
 import os
 from typing import Dict, List, Optional
+from dotenv import load_dotenv
+
+# 加载环境变量
+load_dotenv('OKX.env')
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
