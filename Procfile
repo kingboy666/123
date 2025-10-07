@@ -1,1 +1,1 @@
-web: python main.py
+web: python MACD_6_16_9_策略.py
