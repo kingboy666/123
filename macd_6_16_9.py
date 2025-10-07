@@ -17,14 +17,14 @@ from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
 # 加载环境变量
-load_dotenv('OKX.env')
+load_dotenv()
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class MACDStrategy:
-    def __init__(self, api_key: str, secret: str, passphrase: str = None):
+    def __init__(self, api_key: str, secret: str, passphrase: str = ""):
         """
         初始化MACD策略
         
@@ -36,7 +36,7 @@ class MACDStrategy:
         self.exchange = ccxt.okx({
             'apiKey': api_key,
             'secret': secret,
-            'passphrase': passphrase,
+            'password': passphrase,
             'sandbox': False,  # 生产环境
             'enableRateLimit': True,
         })
@@ -404,19 +404,19 @@ class MACDStrategy:
 def main():
     """主函数"""
     # 重新加载环境变量确保正确加载
-    load_dotenv('OKX.env', override=True)
+    load_dotenv(override=True)
     
     # 从环境变量获取API配置
-    api_key = os.getenv('OKX_API_KEY')
-    secret = os.getenv('OKX_SECRET') 
-    passphrase = os.getenv('OKX_PASSPHRASE')
+    api_key = os.getenv('OKX_API_KEY') or ""
+    secret = os.getenv('OKX_SECRET_KEY') or ""  # 改为与main.py一致
+    passphrase = os.getenv('OKX_PASSPHRASE') or ""
     
     # 调试信息
     logger.info(f"API_KEY: {api_key is not None}")
     logger.info(f"SECRET: {secret is not None}") 
     logger.info(f"PASSPHRASE: {passphrase is not None}")
     
-    if not all([api_key, secret, passphrase]):
+    if not api_key or not secret or not passphrase:
         logger.error("请设置OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE环境变量")
         return
     
