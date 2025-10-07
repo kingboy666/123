@@ -36,7 +36,7 @@ class MACDStrategy:
         self.exchange = ccxt.okx({
             'apiKey': api_key,
             'secret': secret,
-            'password': passphrase,
+            'passphrase': passphrase,
             'sandbox': False,  # 生产环境
             'enableRateLimit': True,
         })
