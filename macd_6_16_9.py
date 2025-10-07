@@ -37,12 +37,13 @@ class MACDStrategy:
             'apiKey': api_key,
             'secret': secret,
             'password': passphrase,
-            'sandbox': False,  # 生产环境
+            'sandbox': False,
             'enableRateLimit': True,
         })
+        self.exchange.set_sandbox_mode(False)  # 实盘模式，与main.py一致
         
-        # 交易对配置
-        self.symbols = ['FIL-USDT', 'ZRO-USDT', 'WIF-USDT', 'WLD-USDT']
+        # 交易对配置 - 改为永续合约，与main.py一致
+        self.symbols = ['FIL-USDT-SWAP', 'ZRO-USDT-SWAP', 'WIF-USDT-SWAP', 'WLD-USDT-SWAP']
         self.leverage = 20
         self.timeframe = '15m'  # 15分钟图
         
