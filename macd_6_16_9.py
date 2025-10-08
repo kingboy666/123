@@ -132,6 +132,15 @@ class MACDStrategy:
         
         # OKX统一参数（强制使用SWAP场景）
         self.okx_params = {'instType': 'SWAP'}
+
+        # 将统一交易对转为OKX instId，例如 FIL/USDT:USDT -> FIL-USDT-SWAP
+        def _symbol_to_inst_id(sym: str) -> str:
+            try:
+                base = sym.split('/')[0]
+                return f"{base}-USDT-SWAP"
+            except Exception:
+                return ''
+        self.symbol_to_inst_id = _symbol_to_inst_id
         
         # 交易对配置 - 小币种
         self.symbols = [
@@ -292,10 +301,20 @@ class MACDStrategy:
             return 0
     
     def get_open_orders(self, symbol: str) -> List[Dict]:
-        """获取未成交订单"""
+        """获取未成交订单（OKX原生接口，避免markets依赖）"""
         try:
-            orders = self.exchange.fetch_open_orders(symbol, self.okx_params)
-            return orders
+            inst_id = self.symbol_to_inst_id(symbol)
+            resp = self.exchange.privateGetTradeOrdersPending({'instType': 'SWAP', 'instId': inst_id})
+            data = resp.get('data') if isinstance(resp, dict) else resp
+            results = []
+            for o in (data or []):
+                results.append({
+                    'id': o.get('ordId') or o.get('clOrdId'),
+                    'side': 'buy' if o.get('side') == 'buy' else 'sell',
+                    'amount': float(o.get('sz') or 0),
+                    'price': float(o.get('px') or 0) if o.get('px') else None,
+                })
+            return results
         except Exception as e:
             logger.error(f"❌ 获取{symbol}挂单失败: {e}")
             return []
@@ -483,17 +502,24 @@ class MACDStrategy:
                 return self.positions_cache[symbol]
             
             # 从交易所获取最新持仓
-            positions = self.exchange.fetch_positions([symbol], self.okx_params)
-            for position in positions:
-                if position['symbol'] == symbol:
+            # 使用OKX原生接口获取持仓，避免markets依赖
+            inst_id = self.symbol_to_inst_id(symbol)
+            resp = self.exchange.privateGetAccountPositions({'instType': 'SWAP', 'instId': inst_id})
+            data = resp.get('data') if isinstance(resp, dict) else resp
+            for p in (data or []):
+                if p.get('instId') == inst_id and float(p.get('pos', 0) or 0) != 0:
+                    size = abs(float(p.get('pos', 0) or 0))
+                    side = 'long' if p.get('posSide') == 'long' else 'short'
+                    entry_price = float(p.get('avgPx', 0) or 0)
+                    leverage = float(p.get('lever', 0) or 0)
+                    unreal = float(p.get('upl', 0) or 0)
                     pos_data = {
-                        'size': float(position.get('contracts', 0) or 0),
-                        'side': position.get('side', 'none'),
-                        'entry_price': float(position.get('entryPrice', 0) or 0),
-                        'unrealized_pnl': float(position.get('unrealizedPnl', 0) or 0),
-                        'leverage': float(position.get('leverage', 0) or 0)
+                        'size': size,
+                        'side': side,
+                        'entry_price': entry_price,
+                        'unrealized_pnl': unreal,
+                        'leverage': leverage,
                     }
-                    # 更新缓存
                     self.positions_cache[symbol] = pos_data
                     return pos_data
             
