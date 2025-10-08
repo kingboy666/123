@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-"""
+# -*- coding: utf-8 -*-
+"""
 MACD(6,16,9)策略 - 15分钟图
 支持FILUSDT, ZROUSDT, WIFUSDT, WLDUSDT四个合约对
-20倍杠杆，智能仓位分配
+20倍杠杆, 智能仓位分配
 """
 
 import ccxt
