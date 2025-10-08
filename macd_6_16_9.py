@@ -513,13 +513,25 @@ class MACDStrategy:
             return 0.0
     
     def get_klines(self, symbol: str, limit: int = 100) -> List[Dict]:
-        """获取K线数据 - 15分钟周期"""
+        """获取K线数据 - 15分钟周期（OKX v5 原生接口）"""
         try:
-            klines = self.exchange.fetch_ohlcv(symbol, self.timeframe, limit=limit)
-            # 转换为DataFrame格式并返回
-            df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            return df.to_dict('records')
+            inst_id = self.symbol_to_inst_id(symbol)
+            # OKX v5: /api/v5/market/candles?instId=...&bar=15m&limit=...
+            params = {'instId': inst_id, 'bar': self.timeframe, 'limit': str(limit)}
+            resp = self.exchange.publicGetMarketCandles(params)
+            rows = resp.get('data') if isinstance(resp, dict) else resp
+            result: List[Dict] = []
+            for r in (rows or []):
+                # OKX返回: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+                ts = int(r[0])
+                o = float(r[1]); h = float(r[2]); l = float(r[3]); c = float(r[4]); v = float(r[5])
+                result.append({
+                    'timestamp': pd.to_datetime(ts, unit='ms'),
+                    'open': o, 'high': h, 'low': l, 'close': c, 'volume': v
+                })
+            # OKX通常返回从新到旧，按时间升序
+            result.sort(key=lambda x: x['timestamp'])
+            return result
         except Exception as e:
             logger.error(f"❌ 获取{symbol}K线数据失败: {e}")
             return []
