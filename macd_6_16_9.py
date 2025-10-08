@@ -193,6 +193,13 @@ class MACDStrategy:
             # 同步交易所时间
             self.sync_exchange_time()
             
+            # 预加载市场数据，避免后续API依赖symbol元数据时报 None + str 错误
+            try:
+                self.exchange.load_markets()
+            except Exception as e:
+                logger.error(f"❌ 预加载市场数据失败: {e}")
+                raise
+            
             # 按交易对设置杠杆（OKX参数为 mgnMode 而非 marginMode）
             for symbol in self.symbols:
                 try:
