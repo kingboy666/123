@@ -848,15 +848,58 @@ class MACDStrategy:
         logger.info(self.stats.get_summary())
         logger.info("=" * 70)
         
+        # 对齐扫描参数（用于15分钟图：在每根K线收盘前1分钟开始扫描）
+        align_to_15m = os.environ.get('ALIGN_TO_15M', 'true').strip().lower() in ('1', 'true', 'yes')
+        try:
+            scan_window_sec = int(os.environ.get('SCAN_WINDOW_SEC', '60'))
+            scan_step_sec = int(os.environ.get('SCAN_STEP_SEC', '3'))
+        except Exception:
+            scan_window_sec = 60
+            scan_step_sec = 3
+
+        china_tz = pytz.timezone('Asia/Shanghai')
+
+        def floor_to_15m(dt: datetime.datetime) -> datetime.datetime:
+            minute = (dt.minute // 15) * 15
+            return dt.replace(minute=minute, second=0, microsecond=0)
+
         while True:
             try:
-                start_ts = time.time()
-                self.execute_strategy()
-                next_run_ts = start_ts + interval
-                next_run_dt = datetime.datetime.fromtimestamp(next_run_ts, tz=pytz.timezone('Asia/Shanghai'))
-                logger.info(f"⏳ 等待下次执行，间隔{interval}秒 ({interval/60:.1f}分钟)，预计: {next_run_dt.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
-                logger.info("")
-                time.sleep(interval)
+                if align_to_15m:
+                    now = datetime.datetime.now(china_tz)
+                    base = floor_to_15m(now)
+                    # 窗口在每个15分钟周期的第14分钟开始
+                    window_start = base + datetime.timedelta(minutes=14)
+                    if now >= base + datetime.timedelta(minutes=15):
+                        # 已过当前周期，滚动到下一个周期
+                        base = base + datetime.timedelta(minutes=15)
+                        window_start = base + datetime.timedelta(minutes=14)
+                    if now < window_start:
+                        sleep_sec = max(0.0, (window_start - now).total_seconds())
+                        logger.info(f"⏲️ 将在对齐窗口开始扫描: {window_start.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)，等待{int(sleep_sec)}秒...")
+                        time.sleep(sleep_sec)
+
+                    # 窗口内连续扫描
+                    window_end = window_start + datetime.timedelta(seconds=scan_window_sec)
+                    logger.info(f"🔎 已进入窗口 [{window_start.strftime('%H:%M:%S')} ~ {window_end.strftime('%H:%M:%S')}]，步长{scan_step_sec}s")
+                    while datetime.datetime.now(china_tz) < window_end:
+                        self.execute_strategy()
+                        time.sleep(max(1, scan_step_sec))
+
+                    # 窗口结束后，等待到下一个周期窗口
+                    next_base = base + datetime.timedelta(minutes=15)
+                    next_window_start = next_base + datetime.timedelta(minutes=14)
+                    wait_sec = max(0.0, (next_window_start - datetime.datetime.now(china_tz)).total_seconds())
+                    logger.info(f"⏳ 窗口结束，下一窗口 {next_window_start.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)，等待{int(wait_sec)}秒...")
+                    time.sleep(wait_sec)
+                else:
+                    start_ts = time.time()
+                    self.execute_strategy()
+                    next_run_ts = start_ts + interval
+                    next_run_dt = datetime.datetime.fromtimestamp(next_run_ts, tz=china_tz)
+                    logger.info(f"⏳ 等待下次执行，间隔{interval}秒 ({interval/60:.1f}分钟)，预计: {next_run_dt.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
+                    logger.info("")
+                    time.sleep(interval)
                 
             except KeyboardInterrupt:
                 logger.info("⛔ 用户中断，策略停止")
@@ -864,7 +907,6 @@ class MACDStrategy:
             except Exception as e:
                 logger.error(f"❌ 策略运行异常: {e}")
                 logger.info("🔄 60秒后重试...")
-                # 遇到异常等待后继续尝试，不终止程序
                 time.sleep(60)
 
 def main():
