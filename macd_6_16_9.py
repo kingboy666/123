@@ -10,18 +10,29 @@ import datetime
 import os
 import json
 from typing import Dict, Any, List, Optional
+import pytz
 
 import ccxt
 import pandas as pd
 import numpy as np
 
+# 配置日志 - 使用中国时区
+class ChinaTimeFormatter(logging.Formatter):
+    """中国时区的日志格式化器"""
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.datetime.fromtimestamp(record.created, tz=pytz.timezone('Asia/Shanghai'))
+        if datefmt:
+            s = dt.strftime(datefmt)
+        else:
+            s = dt.strftime('%Y-%m-%d %H:%M:%S')
+        return s
+
 # 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+handler = logging.StreamHandler()
+handler.setFormatter(ChinaTimeFormatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.addHandler(handler)
 
 class TradingStats:
     """交易统计类"""
@@ -68,9 +79,10 @@ class TradingStats:
             self.stats['loss_trades'] += 1
             self.stats['total_loss_pnl'] += pnl
         
-        # 添加交易历史
+        # 添加交易历史 - 使用北京时间
+        china_tz = pytz.timezone('Asia/Shanghai')
         trade_record = {
-            'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'timestamp': datetime.datetime.now(china_tz).strftime('%Y-%m-%d %H:%M:%S'),
             'symbol': symbol,
             'side': side,
             'pnl': round(pnl, 4)
@@ -152,6 +164,9 @@ class MACDStrategy:
         
         # 首次同步状态
         self.sync_all_status()
+        
+        # 处理启动前已有的持仓和挂单
+        self.handle_existing_positions_and_orders()
     
     def _setup_exchange(self):
         """设置交易所配置"""
@@ -184,17 +199,19 @@ class MACDStrategy:
             raise
     
     def sync_exchange_time(self):
-        """同步交易所时间"""
+        """同步交易所时间 - 使用中国时区"""
         try:
             server_time = self.exchange.fetch_time()
             local_time = int(time.time() * 1000)
             time_diff = server_time - local_time
             
-            server_dt = datetime.datetime.fromtimestamp(server_time / 1000)
-            local_dt = datetime.datetime.fromtimestamp(local_time / 1000)
+            # 转换为中国时区
+            china_tz = pytz.timezone('Asia/Shanghai')
+            server_dt = datetime.datetime.fromtimestamp(server_time / 1000, tz=china_tz)
+            local_dt = datetime.datetime.fromtimestamp(local_time / 1000, tz=china_tz)
             
-            logger.info(f"🕐 服务器时间: {server_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-            logger.info(f"🕐 本地时间: {local_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"🕐 交易所时间: {server_dt.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
+            logger.info(f"🕐 本地时间: {local_dt.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
             logger.info(f"⏱️ 时间差: {time_diff}ms")
             
             if abs(time_diff) > 5000:
@@ -243,6 +260,9 @@ class MACDStrategy:
             self.sync_exchange_time()
             
             # 同步所有交易对的持仓和挂单
+            has_positions = False
+            has_orders = False
+            
             for symbol in self.symbols:
                 # 同步持仓
                 position = self.get_position(symbol, force_refresh=True)
@@ -251,6 +271,7 @@ class MACDStrategy:
                 # 记录持仓状态
                 if position['size'] > 0:
                     self.last_position_state[symbol] = position['side']
+                    has_positions = True
                 else:
                     self.last_position_state[symbol] = 'none'
                 
@@ -260,18 +281,94 @@ class MACDStrategy:
                 
                 # 输出状态
                 if position['size'] > 0:
-                    logger.info(f"📊 {symbol} 持仓: {position['side']} {position['size']:.6f} @{position['entry_price']:.2f} PNL:{position['unrealized_pnl']:.2f}U")
+                    logger.info(f"📊 {symbol} 持仓: {position['side']} {position['size']:.6f} @{position['entry_price']:.2f} PNL:{position['unrealized_pnl']:.2f}U 杠杆:{position['leverage']}x")
                 
                 if orders:
+                    has_orders = True
                     logger.info(f"📋 {symbol} 挂单数量: {len(orders)}")
                     for order in orders:
                         logger.info(f"   └─ {order['side']} {order['amount']:.6f} @{order.get('price', 'market')}")
+            
+            if not has_positions:
+                logger.info("ℹ️ 当前无持仓")
+            
+            if not has_orders:
+                logger.info("ℹ️ 当前无挂单")
             
             self.last_sync_time = time.time()
             logger.info("✅ 状态同步完成")
             
         except Exception as e:
             logger.error(f"❌ 同步状态失败: {e}")
+    
+    def handle_existing_positions_and_orders(self):
+        """处理程序启动时已有的持仓和挂单"""
+        logger.info("=" * 70)
+        logger.info("🔍 检查启动前的持仓和挂单状态...")
+        logger.info("=" * 70)
+        
+        has_positions = False
+        has_orders = False
+        
+        for symbol in self.symbols:
+            # 检查持仓
+            position = self.get_position(symbol, force_refresh=True)
+            if position['size'] > 0:
+                has_positions = True
+                logger.warning(f"⚠️ 检测到{symbol}已有持仓: {position['side']} {position['size']:.6f} @{position['entry_price']:.2f} PNL:{position['unrealized_pnl']:.2f}U")
+                # 记录已有持仓状态
+                self.last_position_state[symbol] = position['side']
+            
+            # 检查挂单
+            orders = self.get_open_orders(symbol)
+            if orders:
+                has_orders = True
+                logger.warning(f"⚠️ 检测到{symbol}有{len(orders)}个未成交订单")
+                for order in orders:
+                    logger.info(f"   └─ {order['side']} {order['amount']:.6f} @{order.get('price', 'market')} ID:{order['id']}")
+        
+        if has_positions or has_orders:
+            logger.info("=" * 70)
+            logger.info("❓ 程序启动时检测到已有持仓或挂单")
+            logger.info("💡 策略说明:")
+            logger.info("   1. 已有持仓: 程序会根据MACD信号管理，出现反向信号时平仓")
+            logger.info("   2. 已有挂单: 程序会在下次交易前自动取消")
+            logger.info("   3. 程序会继续运行并根据信号执行交易")
+            logger.info("=" * 70)
+            logger.info("⚠️ 如果需要立即平仓所有持仓，请手动操作或重启程序前先手动平仓")
+            logger.info("=" * 70)
+        else:
+            logger.info("✅ 启动前无持仓和挂单，可以正常运行")
+            logger.info("=" * 70)
+    
+    def display_current_positions(self):
+        """显示当前所有持仓状态"""
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("📊 当前持仓状态")
+        logger.info("=" * 70)
+        
+        has_positions = False
+        total_pnl = 0.0
+        
+        for symbol in self.symbols:
+            position = self.get_position(symbol, force_refresh=False)
+            if position['size'] > 0:
+                has_positions = True
+                pnl = position['unrealized_pnl']
+                total_pnl += pnl
+                pnl_emoji = "📈" if pnl > 0 else "📉" if pnl < 0 else "➖"
+                logger.info(f"{pnl_emoji} {symbol}: {position['side'].upper()} | 数量:{position['size']:.6f} | 入场价:{position['entry_price']:.2f} | 盈亏:{pnl:.2f}U | 杠杆:{position['leverage']}x")
+        
+        if has_positions:
+            total_emoji = "💰" if total_pnl > 0 else "💸" if total_pnl < 0 else "➖"
+            logger.info("-" * 70)
+            logger.info(f"{total_emoji} 总浮动盈亏: {total_pnl:.2f} USDT")
+        else:
+            logger.info("ℹ️ 当前无持仓")
+        
+        logger.info("=" * 70)
+        logger.info("")
     
     def check_sync_needed(self):
         """检查是否需要同步状态"""
@@ -573,6 +670,12 @@ class MACDStrategy:
             # 显示交易统计
             logger.info(self.stats.get_summary())
             
+            # 显示当前持仓状态
+            self.display_current_positions()
+            
+            logger.info("🔍 分析交易信号...")
+            logger.info("-" * 70)
+            
             # 分析所有交易对
             signals = {}
             for symbol in self.symbols:
@@ -581,12 +684,14 @@ class MACDStrategy:
                 open_orders = self.get_open_orders(symbol)
                 
                 status_line = f"📊 {symbol}: 信号={signals[symbol]['signal']}, 原因={signals[symbol]['reason']}"
-                if position['size'] > 0:
-                    status_line += f", 持仓={position['side']} {position['size']:.6f} PNL={position['unrealized_pnl']:.2f}U"
                 if open_orders:
                     status_line += f", 挂单={len(open_orders)}个"
                 
                 logger.info(status_line)
+            
+            logger.info("-" * 70)
+            logger.info("⚡ 执行交易操作...")
+            logger.info("")
             
             # 执行交易
             for symbol, signal_info in signals.items():
