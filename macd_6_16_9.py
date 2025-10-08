@@ -15,6 +15,7 @@ import pytz
 import ccxt
 import pandas as pd
 import numpy as np
+import math
 
 # 配置日志 - 使用中国时区和UTF-8编码
 class ChinaTimeFormatter(logging.Formatter):
@@ -608,71 +609,95 @@ class MACDStrategy:
             return 0
     
     def create_order(self, symbol: str, side: str, amount: float) -> bool:
-        """创建订单 - 小币种版本，支持小额交易"""
+        """创建订单 - 小币种版本，支持小额交易（OKX原生下单，避免精度与symbol转换问题）"""
         try:
             # 检查是否有挂单
             if self.has_open_orders(symbol):
                 logger.warning(f"⚠️ {symbol}存在未成交订单，先取消")
                 self.cancel_all_orders(symbol)
                 time.sleep(1)  # 等待订单取消
-            
-            # 小币种：只要金额大于0就尝试下单
+
             if amount <= 0:
                 logger.warning(f"⚠️ {symbol}下单金额为0，跳过")
                 return False
-            
+
             # 获取市场信息
             market_info = self.markets_info.get(symbol, {})
-            min_amount = market_info.get('min_amount', 0.001)
-            amount_precision = market_info.get('amount_precision', 8)
-            
+            min_amount = float(market_info.get('min_amount', 0.001) or 0.001)
+            amount_precision = int(market_info.get('amount_precision', 8) or 8)
+            lot_sz = market_info.get('lot_size')  # 可能为 None
+
             # 获取当前价格
             ticker = self.exchange.fetch_ticker(symbol)
             current_price = float(ticker['last'])
-            
-            # 计算合约数量（基于金额/价格），再按精度与最小数量修正
+
+            # 计算合约数量（基于金额/价格）
             contract_size = amount / current_price
 
-            # 最小数量与步进修正
+            # 先确保不低于最小数量
             if contract_size < min_amount:
                 contract_size = min_amount
 
-            # 使用交易所精度函数确保合法
-            try:
-                contract_size = float(self.exchange.amount_to_precision(symbol, contract_size))
-            except Exception:
+            # 先按步进截断，再按小数位四舍五入
+            if lot_sz:
+                try:
+                    step = float(lot_sz)
+                    if step > 0:
+                        contract_size = math.floor(contract_size / step) * step
+                except Exception:
+                    pass
+            contract_size = round(contract_size, amount_precision)
+
+            # 防止截断后为0或仍小于最小数量
+            if contract_size <= 0 or contract_size < min_amount:
+                contract_size = max(min_amount, 10 ** (-amount_precision))
+                if lot_sz:
+                    try:
+                        step = float(lot_sz)
+                        if step > 0:
+                            contract_size = math.ceil(contract_size / step) * step
+                    except Exception:
+                        pass
                 contract_size = round(contract_size, amount_precision)
 
-            # 防止被精度截断为0
             if contract_size <= 0:
-                contract_size = max(min_amount, 10 ** (-amount_precision))
-                try:
-                    contract_size = float(self.exchange.amount_to_precision(symbol, contract_size))
-                except Exception:
-                    contract_size = round(contract_size, amount_precision)
-
-            # 再次确保不低于最小数量
-            if contract_size < min_amount:
-                logger.warning(f"⚠️ {symbol}数量在精度修正后仍低于最小限制: {contract_size:.8f} < {min_amount:.8f}")
+                logger.warning(f"⚠️ {symbol}最终数量无效: {contract_size}")
                 return False
-            
-            logger.info(f"📝 准备下单: {symbol} {side} 金额:{amount:.4f}U 价格:{current_price:.4f} 数量:{contract_size:.8f}")
-            
-            # 创建市价单（OKX 对冲模式需要传 posSide）
+
+            logger.info(f"📝 准备下单(OKX原生): {symbol} {side} 金额:{amount:.4f}U 价格:{current_price:.4f} 数量:{contract_size:.8f}")
+
+            # 使用 OKX 原生下单接口
             pos_side = 'long' if side == 'buy' else 'short'
-            params = {'posSide': pos_side, 'tdMode': 'cross'}
-            order = self.exchange.create_market_order(symbol, side, contract_size, params)
-            
-            if order['id']:
-                logger.info(f"✅ 成功创建{symbol} {side}订单，金额:{amount:.4f}U，数量:{contract_size:.8f}")
+            inst_id = self.symbol_to_inst_id(symbol)
+            params = {
+                'instId': inst_id,
+                'tdMode': 'cross',
+                'side': side,           # 'buy' or 'sell'
+                'posSide': pos_side,    # 'long' or 'short'（对冲模式）
+                'ordType': 'market',
+                'sz': str(contract_size)
+            }
+            resp = self.exchange.privatePostTradeOrder(params)
+
+            # 提取订单ID
+            order_id = None
+            if isinstance(resp, dict):
+                data = resp.get('data') or []
+                if isinstance(data, list) and data:
+                    order_id = data[0].get('ordId') or data[0].get('clOrdId')
+                else:
+                    order_id = resp.get('ordId') or resp.get('clOrdId')
+
+            if order_id:
+                logger.info(f"✅ 成功创建{symbol} {side}订单，金额:{amount:.4f}U，数量:{contract_size:.8f}，订单ID:{order_id}")
                 # 等待订单成交后刷新持仓
                 time.sleep(2)
                 self.get_position(symbol, force_refresh=True)
                 return True
             else:
-                logger.error(f"❌ 创建{symbol} {side}订单失败")
+                logger.error(f"❌ 创建{symbol} {side}订单失败（未返回订单ID）")
                 return False
-                
+
         except Exception as e:
             logger.error(f"❌ 创建{symbol} {side}订单异常: {e}")
             return False
