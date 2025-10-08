@@ -145,8 +145,8 @@ class MACDStrategy:
         self.slow_period = 16
         self.signal_period = 9
         
-        # 杠杆配置 - 固定25倍
-        self.leverage = 25
+        # 杠杆配置 - 固定20倍
+        self.leverage = 20
         
         # 仓位配置 - 使用100%资金
         self.position_percentage = 1.0
