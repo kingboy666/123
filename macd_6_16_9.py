@@ -591,34 +591,17 @@ class MACDStrategy:
             return False
     
     def calculate_order_amount(self, symbol: str) -> float:
-        """计算下单金额（总余额平均分配，并使用最小USDT下限保证足够覆盖手续费）"""
+        """计算下单金额（总余额平均分成4份，每币用一份余额下单）"""
         try:
             balance = self.get_account_balance()
-            total_amount = balance * self.position_percentage
             num_symbols = max(1, len(self.symbols))
-            allocated_amount = total_amount / num_symbols
-
-            # 读取每币最小USDT下限（默认3U，可通过 PER_SYMBOL_MIN_USDT 调整）
-            try:
-                min_usdt_env = os.environ.get('PER_SYMBOL_MIN_USDT', '').strip()
-                min_usdt = float(min_usdt_env) if min_usdt_env else 3.0
-                if min_usdt <= 0:
-                    min_usdt = 3.0
-            except Exception:
-                min_usdt = 3.0
+            allocated_amount = balance / num_symbols  # 平均分4份
 
             if allocated_amount <= 0:
-                logger.warning(f"⚠️ 可用余额不足，无法为 {symbol} 分配下单金额 (余额:{balance:.4f}U, 使用比例:{self.position_percentage:.2f})")
+                logger.warning(f"⚠️ 余额不足，无法为 {symbol} 分配资金 (余额:{balance:.4f}U)")
                 return 0.0
 
-            # 如果平均分配低于下限且总余额足以支撑所有币按下限分配，则提升到下限
-            if allocated_amount < min_usdt and balance >= min_usdt * num_symbols:
-                logger.info(f"🔧 提升下单金额至下限: {symbol} 从 {allocated_amount:.4f}U 提升到 {min_usdt:.4f}U 以覆盖手续费/最小成本")
-                allocated_amount = min_usdt
-            elif allocated_amount < min_usdt:
-                logger.warning(f"⚠️ 总余额不足以按每币下限 {min_usdt:.2f}U 分配，{symbol}维持平均值 {allocated_amount:.4f}U (余额:{balance:.4f}U)")
-
-            logger.info(f"💵 资金分配: 总余额={balance:.4f}U, 使用比例={self.position_percentage:.2f}, 每币分配={allocated_amount:.4f}U (下限={min_usdt:.2f}U)")
+            logger.info(f"💵 资金分配: 总余额={balance:.4f}U, 每币分配={allocated_amount:.4f}U (共{num_symbols}币)")
             return allocated_amount
 
         except Exception as e:
