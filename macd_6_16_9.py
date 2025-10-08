@@ -129,11 +129,11 @@ class MACDStrategy:
             }
         })
         
-        # 交易对配置
+        # 交易对配置 - 小币种
         self.symbols = [
             'FIL/USDT:USDT',
             'ZRO/USDT:USDT',
-            'WIF/USDT:USD
+            'WIF/USDT:USDT',
             'WLD/USDT:USDT'
         ]
         
@@ -223,19 +223,19 @@ class MACDStrategy:
                         'amount_precision': market['precision']['amount'],
                         'price_precision': market['precision']['price'],
                     }
-                    logger.info(f"📊 {symbol} - 最小数量:{self.markets_info[symbol]['min_amount']:.8f}, 最小金额:{self.markets_info[symbol]['min_cost']:.2f}")
+                    logger.info(f"📊 {symbol} - 最小数量:{self.markets_info[symbol]['min_amount']:.8f}, 最小金额:{self.markets_info[symbol]['min_cost']:.4f}U")
             
             logger.info("✅ 市场信息加载完成")
             
         except Exception as e:
             logger.error(f"❌ 加载市场信息失败: {e}")
-            # 设置默认值
+            # 小币种设置更宽松的默认值
             for symbol in self.symbols:
                 self.markets_info[symbol] = {
-                    'min_amount': 0.01,
-                    'min_cost': 5.0,
+                    'min_amount': 0.001,
+                    'min_cost': 0.1,  # 小币种最小0.1U
                     'amount_precision': 8,
-                    'price_precision': 2,
+                    'price_precision': 4,
                 }
     
     def sync_exchange_time(self):
@@ -352,26 +352,15 @@ class MACDStrategy:
         
         # 检查余额
         balance = self.get_account_balance()
-        logger.info(f"💰 当前可用余额: {balance:.2f} USDT")
-        
-        # 计算每个交易对需要的最小金额
-        total_min_cost = 0
-        for symbol in self.symbols:
-            market_info = self.markets_info.get(symbol, {})
-            min_cost = market_info.get('min_cost', 5.0)
-            total_min_cost += min_cost
-        
-        if balance < total_min_cost:
-            logger.warning(f"⚠️ 余额不足！当前余额:{balance:.2f}U，建议最少:{total_min_cost:.2f}U（{len(self.symbols)}个币种 × 约{total_min_cost/len(self.symbols):.2f}U）")
-        else:
-            logger.info(f"✅ 余额充足，可以正常交易")
+        logger.info(f"💰 当前可用余额: {balance:.4f} USDT")
+        logger.info(f"💡 小币种交易：即使只有0.1U也可以下单")
         
         for symbol in self.symbols:
             # 检查持仓
             position = self.get_position(symbol, force_refresh=True)
             if position['size'] > 0:
                 has_positions = True
-                logger.warning(f"⚠️ 检测到{symbol}已有持仓: {position['side']} {position['size']:.6f} @{position['entry_price']:.2f} PNL:{position['unrealized_pnl']:.2f}U")
+                logger.warning(f"⚠️ 检测到{symbol}已有持仓: {position['side']} {position['size']:.6f} @{position['entry_price']:.4f} PNL:{position['unrealized_pnl']:.2f}U")
                 # 记录已有持仓状态
                 self.last_position_state[symbol] = position['side']
             
@@ -505,7 +494,7 @@ class MACDStrategy:
             return False
     
     def calculate_order_amount(self, symbol: str) -> float:
-        """计算下单金额（使用总余额平均分配，考虑最小限制）"""
+        """计算下单金额（使用总余额平均分配）"""
         try:
             balance = self.get_account_balance()
             # 使用100%余额
@@ -514,16 +503,8 @@ class MACDStrategy:
             # 平均分配到4个交易对
             allocated_amount = total_amount / len(self.symbols)
             
-            # 获取市场信息
-            market_info = self.markets_info.get(symbol, {})
-            min_cost = market_info.get('min_cost', 5.0)
-            
-            # 如果分配金额小于最小金额，使用最小金额
-            if allocated_amount < min_cost:
-                logger.warning(f"⚠️ {symbol}分配金额{allocated_amount:.2f}U小于最小限制{min_cost:.2f}U，使用最小金额")
-                allocated_amount = min_cost
-            
-            logger.debug(f"💵 {symbol}分配金额: {allocated_amount:.4f} USDT (总余额: {balance:.2f} USDT, 最小限制:{min_cost:.2f}U)")
+            # 小币种：只要有余额就下单，不设最小限制
+            logger.debug(f"💵 {symbol}分配金额: {allocated_amount:.4f}U (总余额: {balance:.2f}U)")
             return allocated_amount
             
         except Exception as e:
@@ -531,7 +512,7 @@ class MACDStrategy:
             return 0
     
     def create_order(self, symbol: str, side: str, amount: float) -> bool:
-        """创建订单 - 带精度检查"""
+        """创建订单 - 小币种版本，支持小额交易"""
         try:
             # 检查是否有挂单
             if self.has_open_orders(symbol):
@@ -539,16 +520,15 @@ class MACDStrategy:
                 self.cancel_all_orders(symbol)
                 time.sleep(1)  # 等待订单取消
             
+            # 小币种：只要金额大于0就尝试下单
+            if amount <= 0:
+                logger.warning(f"⚠️ {symbol}下单金额为0，跳过")
+                return False
+            
             # 获取市场信息
             market_info = self.markets_info.get(symbol, {})
-            min_amount = market_info.get('min_amount', 0.01)
-            min_cost = market_info.get('min_cost', 5.0)
+            min_amount = market_info.get('min_amount', 0.001)
             amount_precision = market_info.get('amount_precision', 8)
-            
-            # 检查金额是否满足最小限制
-            if amount < min_cost:
-                logger.warning(f"⚠️ {symbol}下单金额{amount:.2f}U小于最小限制{min_cost:.2f}U，跳过")
-                return False
             
             # 获取当前价格
             ticker = self.exchange.fetch_ticker(symbol)
@@ -557,7 +537,7 @@ class MACDStrategy:
             # 计算合约数量
             contract_size = amount / current_price
             
-            # 检查数量是否满足最小限制
+            # 检查数量是否满足最小限制（只检查数量，不检查金额）
             if contract_size < min_amount:
                 logger.warning(f"⚠️ {symbol}下单数量{contract_size:.8f}小于最小限制{min_amount:.8f}，跳过")
                 return False
@@ -565,13 +545,13 @@ class MACDStrategy:
             # 根据精度调整数量
             contract_size = round(contract_size, amount_precision)
             
-            logger.info(f"📝 准备下单: {symbol} {side} 金额:{amount:.2f}U 价格:{current_price:.2f} 数量:{contract_size:.8f}")
+            logger.info(f"📝 准备下单: {symbol} {side} 金额:{amount:.4f}U 价格:{current_price:.4f} 数量:{contract_size:.8f}")
             
             # 创建市价单
             order = self.exchange.create_market_order(symbol, side, contract_size)
             
             if order['id']:
-                logger.info(f"✅ 成功创建{symbol} {side}订单，金额: {amount:.2f}U，数量: {contract_size:.8f}")
+                logger.info(f"✅ 成功创建{symbol} {side}订单，金额:{amount:.4f}U，数量:{contract_size:.8f}")
                 # 等待订单成交后刷新持仓
                 time.sleep(2)
                 self.get_position(symbol, force_refresh=True)
@@ -788,15 +768,6 @@ class MACDStrategy:
                     # 做多：金叉信号
                     amount = self.calculate_order_amount(symbol)
                     if amount > 0:
-                        # 检查余额是否足够
-                        current_balance = self.get_account_balance()
-                        market_info = self.markets_info.get(symbol, {})
-                        min_cost = market_info.get('min_cost', 5.0)
-                        
-                        if current_balance < min_cost:
-                            logger.warning(f"⚠️ 余额不足({current_balance:.2f}U < {min_cost:.2f}U)，跳过{symbol}交易")
-                            continue
-                        
                         if self.create_order(symbol, 'buy', amount):
                             logger.info(f"🚀 开多{symbol}成功 - {reason}")
                             self.last_position_state[symbol] = 'long'
@@ -810,15 +781,6 @@ class MACDStrategy:
                     # 做空：死叉信号
                     amount = self.calculate_order_amount(symbol)
                     if amount > 0:
-                        # 检查余额是否足够
-                        current_balance = self.get_account_balance()
-                        market_info = self.markets_info.get(symbol, {})
-                        min_cost = market_info.get('min_cost', 5.0)
-                        
-                        if current_balance < min_cost:
-                            logger.warning(f"⚠️ 余额不足({current_balance:.2f}U < {min_cost:.2f}U)，跳过{symbol}交易")
-                            continue
-                        
                         if self.create_order(symbol, 'sell', amount):
                             logger.info(f"📉 开空{symbol}成功 - {reason}")
                             self.last_position_state[symbol] = 'short'
@@ -836,7 +798,7 @@ class MACDStrategy:
     def run_continuous(self, interval: int = 900):
         """连续运行策略"""
         logger.info("=" * 70)
-        logger.info("🚀 MACD策略启动 - RAILWALL平台版")
+        logger.info("🚀 MACD策略启动 - RAILWAY平台版 (小币种)")
         logger.info("=" * 70)
         logger.info(f"📈 MACD参数: 快线={self.fast_period}, 慢线={self.slow_period}, 信号线={self.signal_period}")
         logger.info(f"📊 K线周期: {self.timeframe} (15分钟)")
@@ -844,6 +806,7 @@ class MACDStrategy:
         logger.info(f"⏰ 运行间隔: {interval}秒 ({interval/60:.1f}分钟)")
         logger.info(f"🔄 状态同步: 每{self.sync_interval}秒")
         logger.info(f"📊 监控币种: {', '.join(self.symbols)}")
+        logger.info(f"💡 小币种特性: 支持0.1U起的小额交易")
         logger.info(self.stats.get_summary())
         logger.info("=" * 70)
         
