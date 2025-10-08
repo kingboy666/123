@@ -951,7 +951,7 @@ class MACDStrategy:
         logger.info(f"📊 K线周期: {self.timeframe} (15分钟)")
         lev_desc = ', '.join([f"{s.split('/')[0]}={self.symbol_leverage.get(s, 20)}x" for s in self.symbols])
         logger.info(f"💪 杠杆倍数: {lev_desc}")
-        logger.info("⏰ 刷新方式: 实时巡检（每interval秒执行一次，可用环境变量 SCAN_INTERVAL 调整，默认60秒）")
+        logger.info("⏰ 刷新方式: 实时巡检（每interval秒执行一次，可用环境变量 SCAN_INTERVAL 调整，默认1秒）")
         logger.info(f"🔄 状态同步: 每{self.sync_interval}秒")
         logger.info(f"📊 监控币种: {', '.join(self.symbols)}")
         logger.info(f"💡 小币种特性: 支持0.1U起的小额交易")
@@ -1022,14 +1022,14 @@ def main():
         
         logger.info("✅ 策略初始化成功")
         
-        # 运行策略（扫描间隔可通过环境变量 SCAN_INTERVAL 覆盖，单位秒，默认30s）
+        # 运行策略（扫描间隔可通过环境变量 SCAN_INTERVAL 覆盖，单位秒，默认1s）
         try:
             scan_interval_env = os.environ.get('SCAN_INTERVAL', '').strip()
-            scan_interval = int(scan_interval_env) if scan_interval_env else 60
+            scan_interval = int(scan_interval_env) if scan_interval_env else 1
             if scan_interval <= 0:
-                scan_interval = 60
+                scan_interval = 1
         except Exception:
-            scan_interval = 60
+            scan_interval = 1
         logger.info(f"🛠 扫描间隔设置: {scan_interval} 秒（可用环境变量 SCAN_INTERVAL 覆盖）")
         strategy.run_continuous(interval=scan_interval)
         

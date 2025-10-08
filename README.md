@@ -69,14 +69,14 @@ python main.py
 ## 环境变量配置
 
 ```env
-# 交易所API配置
-API_KEY=your_api_key
-SECRET_KEY=your_secret_key
-PASSPHRASE=your_passphrase
+# 交易所API配置（本项目使用 OKX 前缀变量）
+OKX_API_KEY=your_api_key
+OKX_SECRET_KEY=your_secret_key
+OKX_PASSPHRASE=your_passphrase
 
 # 可选配置
-SYMBOLS=BTC-USDT,ETH-USDT  # 交易对
-MAX_POSITIONS=5            # 最大持仓数
+# 每次扫描的时间间隔（秒）。为 1 表示每秒刷新。已在部署配置中默认设为 1。
+SCAN_INTERVAL=1
 ```
 
 ## 安全特性

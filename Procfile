@@ -1,1 +1,1 @@
-worker: python macd_6_16_9.py
+worker: bash -lc 'export SCAN_INTERVAL=1 && python macd_6_16_9.py'
