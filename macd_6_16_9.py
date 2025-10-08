@@ -194,12 +194,12 @@ class MACDStrategy:
             # 同步交易所时间
             self.sync_exchange_time()
             
-            # 预加载市场数据，仅加载swap，避免其他instType触发解析异常
+            # 预加载市场数据（容错）：仅加载swap，失败则记录并继续，后续使用安全回退
             try:
                 self.exchange.load_markets({'type': 'swap'})
+                logger.info("✅ 预加载市场数据完成 (swap)")
             except Exception as e:
-                logger.error(f"❌ 预加载市场数据失败: {e}")
-                raise
+                logger.warning(f"⚠️ 预加载市场数据失败，将使用安全回退: {e}")
             
             # 按交易对设置杠杆（OKX参数为 mgnMode 而非 marginMode）
             for symbol in self.symbols:
@@ -226,7 +226,11 @@ class MACDStrategy:
         """加载市场信息（获取最小下单量等限制）"""
         try:
             logger.info("🔄 加载市场信息...")
-            markets = self.exchange.load_markets({'type': 'swap'})
+            try:
+                markets = self.exchange.load_markets({'type': 'swap'})
+            except Exception as e:
+                logger.warning(f"⚠️ 加载市场信息失败，使用回退参数: {e}")
+                markets = {}
             
             for symbol in self.symbols:
                 if symbol in markets:
