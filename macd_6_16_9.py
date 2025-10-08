@@ -832,7 +832,7 @@ class MACDStrategy:
         except Exception as e:
             logger.error(f"❌ 执行策略失败: {e}")
     
-    def run_continuous(self, interval: int = 900):
+    def run_continuous(self, interval: int = 30):
         """连续运行策略"""
         logger.info("=" * 70)
         logger.info("🚀 MACD策略启动 - RAILWAY平台版 (小币种)")
@@ -850,8 +850,11 @@ class MACDStrategy:
         
         while True:
             try:
+                start_ts = time.time()
                 self.execute_strategy()
-                logger.info(f"⏳ 等待下次执行，间隔{interval}秒 ({interval/60:.1f}分钟)...")
+                next_run_ts = start_ts + interval
+                next_run_dt = datetime.datetime.fromtimestamp(next_run_ts, tz=pytz.timezone('Asia/Shanghai'))
+                logger.info(f"⏳ 等待下次执行，间隔{interval}秒 ({interval/60:.1f}分钟)，预计: {next_run_dt.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
                 logger.info("")
                 time.sleep(interval)
                 
@@ -901,8 +904,16 @@ def main():
         
         logger.info("✅ 策略初始化成功")
         
-        # 运行策略
-        strategy.run_continuous()
+        # 运行策略（扫描间隔可通过环境变量 SCAN_INTERVAL 覆盖，单位秒，默认30s）
+        try:
+            scan_interval_env = os.environ.get('SCAN_INTERVAL', '').strip()
+            scan_interval = int(scan_interval_env) if scan_interval_env else 30
+            if scan_interval <= 0:
+                scan_interval = 30
+        except Exception:
+            scan_interval = 30
+        logger.info(f"🛠 扫描间隔设置: {scan_interval} 秒（可用环境变量 SCAN_INTERVAL 覆盖）")
+        strategy.run_continuous(interval=scan_interval)
         
     except Exception as e:
         logger.error(f"❌ 策略初始化或运行失败: {e}")
