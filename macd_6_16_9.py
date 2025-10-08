@@ -951,7 +951,7 @@ class MACDStrategy:
         logger.info(f"📊 K线周期: {self.timeframe} (15分钟)")
         lev_desc = ', '.join([f"{s.split('/')[0]}={self.symbol_leverage.get(s, 20)}x" for s in self.symbols])
         logger.info(f"💪 杠杆倍数: {lev_desc}")
-        logger.info("⏰ 刷新方式: 北京时间15分钟准点刷新（00/15/30/45），提前1分钟预热")
+        logger.info("⏰ 刷新方式: 实时巡检（每interval秒执行一次，可用环境变量 SCAN_INTERVAL 调整，默认60秒）")
         logger.info(f"🔄 状态同步: 每{self.sync_interval}秒")
         logger.info(f"📊 监控币种: {', '.join(self.symbols)}")
         logger.info(f"💡 小币种特性: 支持0.1U起的小额交易")
@@ -962,40 +962,20 @@ class MACDStrategy:
 
         while True:
             try:
-                # 计算下一个15分钟准点（北京时间），并在准点前60秒开始预热
-                now = datetime.datetime.now(china_tz)
-                # 下一个 00/15/30/45 的边界
-                next_quarter = (now.replace(second=0, microsecond=0)
-                                .replace(minute=(now.minute // 15) * 15) + datetime.timedelta(minutes=15))
-                prewarm_start = next_quarter - datetime.timedelta(seconds=60)
+                # 实时巡检模式：每 interval 秒执行一次
+                start_ts = time.time()
 
-                if now < prewarm_start:
-                    wait_sec = int((prewarm_start - now).total_seconds())
-                    logger.info(f"⏳ 等待至预热开始: {prewarm_start.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)，约{wait_sec}秒...")
-                    time.sleep(wait_sec)
+                # 按需同步状态（内部有节流）
+                self.check_sync_needed()
 
-                # 预热阶段：同步状态并拉取行情，确保准点不丢信号
-                logger.info(f"🔥 预热开始（提前60秒）：目标准点 {next_quarter.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
-                try:
-                    self.check_sync_needed()
-                    # 轻量行情预拉，暖链路/缓存
-                    for sym in self.symbols:
-                        _ = self.get_klines(sym, 100)
-                    logger.info("✅ 预热完成，等待准点触发...")
-                except Exception as e:
-                    logger.warning(f"⚠️ 预热过程出现问题: {e}，继续等待准点")
-
-                # 等待到准点秒级触发
-                now = datetime.datetime.now(china_tz)
-                if now < next_quarter:
-                    wait_to_quarter = max(0.0, (next_quarter - now).total_seconds())
-                    time.sleep(wait_to_quarter)
-
-                # 准点执行策略
+                # 执行策略（含拉取行情、分析与下单）
                 self.execute_strategy()
 
-                # 避免同秒重复触发
-                time.sleep(1)
+                # 计算本轮耗时与休眠
+                elapsed = time.time() - start_ts
+                sleep_sec = max(1, int(interval - elapsed)) if interval > 0 else 1
+                logger.info(f"⏳ 休眠 {sleep_sec} 秒后继续实时巡检...")
+                time.sleep(sleep_sec)
 
             except KeyboardInterrupt:
                 logger.info("⛔ 用户中断，策略停止")
