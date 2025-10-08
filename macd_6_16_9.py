@@ -210,7 +210,7 @@ class MACDStrategy:
             # 统一默认类型与结算币种，减少内部推断
             try:
                 opts = self.exchange.options or {}
-                opts.update({'defaultType': 'swap', 'defaultSettle': 'USDT'})
+                opts.update({'defaultType': 'swap', 'defaultSettle': 'USDT', 'version': 'v5'})
                 self.exchange.options = opts
             except Exception:
                 pass
@@ -666,31 +666,25 @@ class MACDStrategy:
 
             logger.info(f"📝 准备下单(OKX原生): {symbol} {side} 金额:{amount:.4f}U 价格:{current_price:.4f} 数量:{contract_size:.8f}")
 
-            # 使用 OKX 原生下单接口
+            # 使用 ccxt 统一下单接口（市场单），避免私有路由拼接异常
             pos_side = 'long' if side == 'buy' else 'short'
-            inst_id = self.symbol_to_inst_id(symbol)
             params = {
-                'instId': inst_id,
                 'tdMode': 'cross',
-                'side': side,           # 'buy' or 'sell'
-                'posSide': pos_side,    # 'long' or 'short'（对冲模式）
-                'ordType': 'market',
-                'sz': str(contract_size)
+                'posSide': pos_side
             }
-            resp = self.exchange.privatePostTradeOrder(params)
+            resp = self.exchange.create_order(symbol, 'market', side, contract_size, None, params)
 
-            # 提取订单ID
+            # 提取订单ID（兼容不同返回结构）
             order_id = None
             if isinstance(resp, dict):
-                data = resp.get('data') or []
-                if isinstance(data, list) and data:
-                    order_id = data[0].get('ordId') or data[0].get('clOrdId')
-                else:
-                    order_id = resp.get('ordId') or resp.get('clOrdId')
+                order_id = resp.get('id') or resp.get('orderId') or resp.get('ordId')
+            if not order_id and isinstance(resp, list) and resp:
+                maybe = resp[0]
+                if isinstance(maybe, dict):
+                    order_id = maybe.get('id') or maybe.get('orderId') or maybe.get('ordId')
 
             if order_id:
                 logger.info(f"✅ 成功创建{symbol} {side}订单，金额:{amount:.4f}U，数量:{contract_size:.8f}，订单ID:{order_id}")
-                # 等待订单成交后刷新持仓
                 time.sleep(2)
                 self.get_position(symbol, force_refresh=True)
                 return True
