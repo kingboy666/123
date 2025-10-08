@@ -1,1 +1,1 @@
-web: python macd_6_16_9.py
+worker: python macd_6_16_9.py

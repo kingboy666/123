@@ -1,5 +1,5 @@
-ccxt==4.2.85
 pandas==2.2.1
 numpy==1.26.4
 requests==2.31.0
 urllib3==2.1.0
+ccxt==4.3.94

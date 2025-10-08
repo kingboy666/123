@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
+# -*- coding: utf-8 -*-"""
 MACD(6,16,9)策略 - 15分钟图
 支持FILUSDT, ZROUSDT, WIFUSDT, WLDUSDT四个合约对
 20倍杠杆，智能仓位分配
@@ -29,39 +28,30 @@ class MACDStrategy:
             secret: 密钥
             passphrase: 密码短语（OKX需要）
         """
+        # 正确设置OKX交易所参数
         self.exchange = ccxt.okx({
             'apiKey': api_key,
             'secret': secret,
-            'password': passphrase,
-            'sandbox': False,
+            'password': passphrase,  # OKX使用password字段作为passphrase
             'enableRateLimit': True,
+            'options': {
+                'defaultType': 'swap',  # 设置默认类型为永续合约
+            }
         })
-        self.exchange.set_sandbox_mode(False)  # 实盘模式，与main.py一致
         
-        # 交易对配置 - 改为永续合约，与main.py一致
-        self.symbols = ['FIL-USDT-SWAP', 'ZRO-USDT-SWAP', 'WIF-USDT-SWAP', 'WLD-USDT-SWAP']
+        # 交易对配置 - 正确的永续合约交易对格式
+        self.symbols = ['FIL/USDT:USDT', 'ZRO/USDT:USDT', 'WIF/USDT:USDT', 'WLD/USDT:USDT']
         
-        # 杠杆配置 - 统一使用25倍杠杆，确保四个交易对都能做
-        self.max_leverage_btc = 25  # BTC最大杠杆25倍
-        self.max_leverage_eth = 25  # ETH最大杠杆25倍
-        self.max_leverage_major = 25  # 主流币最大杠杆25倍
-        self.max_leverage_others = 25  # 其他币种最大杠杆25倍
-        self.leverage_min = 25  # 最低杠杆25倍
-        
-        # 主流币种定义
-        self.major_coins = ['BNB', 'XRP', 'ADA', 'SOL', 'DOT', 'AVAX', 'DOGE']
-    
-    def get_smart_leverage(self, symbol: str, account_balance: float) -> int:
-        """根据币种和账户大小智能计算杠杆倍数 - 统一使用25倍"""
-        # 统一使用25倍杠杆，确保四个交易对都能做
-        return 25
-        
+        # 时间周期设置
         self.timeframe = '15m'  # 15分钟图
         
-        # MACD参数 - 与main.py保持一致
-        self.fast_period = 8
-        self.slow_period = 21
-        self.signal_period = 9
+        # MACD参数
+        self.fast_period = 6  # 快速周期为6
+        self.slow_period = 16  # 慢速周期为16
+        self.signal_period = 9  # 信号周期为9
+        
+        # 杠杆配置 - 统一使用25倍杠杆
+        self.max_leverage = 25  # 最大杠杆25倍
         
         # 仓位配置
         self.position_percentage: float = 0.8  # 使用80%余额
@@ -73,14 +63,23 @@ class MACDStrategy:
         # 初始化交易所
         self._setup_exchange()
     
+    def get_smart_leverage(self, symbol: str, account_balance: float = 1000) -> int:
+        """根据币种和账户大小智能计算杠杆倍数"""
+        # 统一使用25倍杠杆
+        return self.max_leverage
+    
     def _setup_exchange(self):
         """设置交易所配置"""
         try:
+            # 检查连接
+            self.exchange.check_required_credentials()
+            
             # 设置杠杆
             for symbol in self.symbols:
                 # 使用智能杠杆计算
-                smart_leverage = self.get_smart_leverage(symbol, 1000)  # 默认账户余额1000
-                self.exchange.set_leverage(smart_leverage, symbol)
+                smart_leverage = self.get_smart_leverage(symbol)
+                # CCXT OKX的set_leverage需要添加参数
+                self.exchange.set_leverage(smart_leverage, symbol, {'marginMode': 'cross'})
                 logger.info(f"设置{symbol}杠杆为{smart_leverage}倍")
             
             # 设置合约模式
@@ -202,7 +201,7 @@ class MACDStrategy:
             logger.error(f"获取{symbol}持仓失败: {e}")
             return {'size': 0, 'side': 'none', 'entry_price': 0, 'unrealized_pnl': 0}
     
-    def calculate_order_amount(self, symbol: str, price: float) -> float:
+    def calculate_order_amount(self, symbol: str, price: float = 0) -> float:
         """
         计算下单金额（平均分配）
         
@@ -220,12 +219,8 @@ class MACDStrategy:
             # 平均分配到每个交易对
             allocated_amount = total_amount / len(self.symbols)
             
-            # 计算合约数量
-            ticker = self.exchange.fetch_ticker(symbol)
-            min_order_value = float(ticker.get('info', {}).get('minOrderAmount', self.min_order_value))
-            
             # 确保不低于最小下单金额
-            order_amount = max(allocated_amount, min_order_value)
+            order_amount = max(allocated_amount, self.min_order_value)
             
             logger.info(f"{symbol}分配金额: {order_amount:.2f} USDT")
             return order_amount
@@ -283,10 +278,6 @@ class MACDStrategy:
             if position['size'] == 0:
                 logger.info(f"{symbol}无持仓，无需平仓")
                 return True
-            
-            # 获取当前价格
-            ticker = self.exchange.fetch_ticker(symbol)
-            current_price = ticker['last']
             
             # 计算合约数量
             size = float(position.get('size', 0) or 0)
@@ -374,12 +365,12 @@ class MACDStrategy:
                 reason = signal_info['reason']
                 
                 if signal == 'buy':
-                    amount = self.calculate_order_amount(symbol, 0)
+                    amount = self.calculate_order_amount(symbol)
                     if self.create_order(symbol, 'buy', amount):
                         logger.info(f"开多{symbol}成功")
                 
                 elif signal == 'sell':
-                    amount = self.calculate_order_amount(symbol, 0)
+                    amount = self.calculate_order_amount(symbol)
                     if self.create_order(symbol, 'sell', amount):
                         logger.info(f"开空{symbol}成功")
                 
@@ -431,12 +422,12 @@ def main():
     passphrase = os.getenv('OKX_PASSPHRASE') or ""
     
     # 调试信息
-    logger.info(f"API_KEY: {api_key is not None}")
-    logger.info(f"SECRET: {secret is not None}") 
-    logger.info(f"PASSPHRASE: {passphrase is not None}")
+    logger.info(f"API_KEY: {'已设置' if api_key else '未设置'}")
+    logger.info(f"SECRET: {'已设置' if secret else '未设置'}") 
+    logger.info(f"PASSPHRASE: {'已设置' if passphrase else '未设置'}")
     
     if not api_key or not secret or not passphrase:
-        logger.error("请设置OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE环境变量")
+        logger.error("请设置OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE环境变量")
         return
     
     # 创建策略实例
