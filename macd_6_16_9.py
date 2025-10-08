@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 """MACD策略实现 - RAILWALL平台版本
 25倍杠杆，无限制交易，带挂单识别和状态同步
+增加胜率统计和盈亏显示
 """
 import time
 import logging
 import datetime
 import os
+import json
 from typing import Dict, Any, List, Optional
 
 import ccxt
@@ -20,6 +22,81 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+class TradingStats:
+    """交易统计类"""
+    def __init__(self, stats_file: str = 'trading_stats.json'):
+        self.stats_file = stats_file
+        self.stats = {
+            'total_trades': 0,
+            'win_trades': 0,
+            'loss_trades': 0,
+            'total_pnl': 0.0,
+            'total_win_pnl': 0.0,
+            'total_loss_pnl': 0.0,
+            'trades_history': []
+        }
+        self.load_stats()
+    
+    def load_stats(self):
+        """加载统计数据"""
+        try:
+            if os.path.exists(self.stats_file):
+                with open(self.stats_file, 'r') as f:
+                    self.stats = json.load(f)
+                logger.info(f"✅ 加载历史统计数据：总交易{self.stats['total_trades']}笔")
+        except Exception as e:
+            logger.warning(f"⚠️ 加载统计数据失败: {e}，使用新数据")
+    
+    def save_stats(self):
+        """保存统计数据"""
+        try:
+            with open(self.stats_file, 'w') as f:
+                json.dump(self.stats, f, indent=2)
+        except Exception as e:
+            logger.error(f"❌ 保存统计数据失败: {e}")
+    
+    def add_trade(self, symbol: str, side: str, pnl: float):
+        """添加交易记录"""
+        self.stats['total_trades'] += 1
+        self.stats['total_pnl'] += pnl
+        
+        if pnl > 0:
+            self.stats['win_trades'] += 1
+            self.stats['total_win_pnl'] += pnl
+        else:
+            self.stats['loss_trades'] += 1
+            self.stats['total_loss_pnl'] += pnl
+        
+        # 添加交易历史
+        trade_record = {
+            'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'symbol': symbol,
+            'side': side,
+            'pnl': round(pnl, 4)
+        }
+        self.stats['trades_history'].append(trade_record)
+        
+        # 只保留最近100条记录
+        if len(self.stats['trades_history']) > 100:
+            self.stats['trades_history'] = self.stats['trades_history'][-100:]
+        
+        self.save_stats()
+    
+    def get_win_rate(self) -> float:
+        """计算胜率"""
+        if self.stats['total_trades'] == 0:
+            return 0.0
+        return (self.stats['win_trades'] / self.stats['total_trades']) * 100
+    
+    def get_summary(self) -> str:
+        """获取统计摘要"""
+        win_rate = self.get_win_rate()
+        return (f"📊 交易统计: 总计{self.stats['total_trades']}笔 | "
+                f"胜{self.stats['win_trades']}笔 负{self.stats['loss_trades']}笔 | "
+                f"胜率{win_rate:.1f}% | "
+                f"总盈亏{self.stats['total_pnl']:.2f}U | "
+                f"盈利{self.stats['total_win_pnl']:.2f}U 亏损{self.stats['total_loss_pnl']:.2f}U")
 
 class MACDStrategy:
     """MACD策略类"""
@@ -44,7 +121,7 @@ class MACDStrategy:
             'BTC/USDT:USDT'
         ]
         
-        # 时间周期
+        # 时间周期 - 15分钟
         self.timeframe = '15m'
         
         # MACD参数
@@ -63,6 +140,12 @@ class MACDStrategy:
         self.open_orders_cache: Dict[str, List] = {}
         self.last_sync_time: float = 0
         self.sync_interval: int = 60  # 60秒同步一次状态
+        
+        # 交易统计
+        self.stats = TradingStats()
+        
+        # 记录上次持仓状态，用于判断是否已平仓
+        self.last_position_state: Dict[str, str] = {}  # symbol -> 'long'/'short'/'none'
         
         # 初始化交易所
         self._setup_exchange()
@@ -88,12 +171,13 @@ class MACDStrategy:
                 except Exception as e:
                     logger.warning(f"⚠️ 设置{symbol}杠杆失败（可能已设置）: {e}")
             
-            # 设置合约模式
+            # 尝试设置合约模式（如果有持仓会失败，但不影响运行）
             try:
                 self.exchange.set_position_mode(False)  # 单向持仓模式
                 logger.info("✅ 设置为单向持仓模式")
             except Exception as e:
-                logger.warning(f"⚠️ 设置持仓模式失败（可能已设置）: {e}")
+                logger.warning(f"⚠️ 设置持仓模式失败（当前可能有持仓，跳过设置）")
+                logger.info("ℹ️ 程序将继续运行，使用当前持仓模式")
             
         except Exception as e:
             logger.error(f"❌ 交易所设置失败: {e}")
@@ -164,13 +248,19 @@ class MACDStrategy:
                 position = self.get_position(symbol, force_refresh=True)
                 self.positions_cache[symbol] = position
                 
+                # 记录持仓状态
+                if position['size'] > 0:
+                    self.last_position_state[symbol] = position['side']
+                else:
+                    self.last_position_state[symbol] = 'none'
+                
                 # 同步挂单
                 orders = self.get_open_orders(symbol)
                 self.open_orders_cache[symbol] = orders
                 
                 # 输出状态
                 if position['size'] > 0:
-                    logger.info(f"📊 {symbol} 持仓: {position['side']} {position['size']:.6f} @{position['entry_price']:.2f} PNL:{position['unrealized_pnl']:.2f}")
+                    logger.info(f"📊 {symbol} 持仓: {position['side']} {position['size']:.6f} @{position['entry_price']:.2f} PNL:{position['unrealized_pnl']:.2f}U")
                 
                 if orders:
                     logger.info(f"📋 {symbol} 挂单数量: {len(orders)}")
@@ -204,7 +294,7 @@ class MACDStrategy:
             return 0
     
     def get_klines(self, symbol: str, limit: int = 100) -> List[Dict]:
-        """获取K线数据"""
+        """获取K线数据 - 15分钟周期"""
         try:
             klines = self.exchange.fetch_ohlcv(symbol, self.timeframe, limit=limit)
             # 转换为DataFrame格式并返回
@@ -335,22 +425,34 @@ class MACDStrategy:
                 logger.info(f"ℹ️ {symbol}无持仓，无需平仓")
                 return True
             
+            # 记录平仓前的盈亏
+            pnl = position.get('unrealized_pnl', 0)
+            position_side = position.get('side', 'unknown')
+            
             # 获取合约数量
             size = float(position.get('size', 0) or 0)
             
             # 反向平仓：多头平仓用sell，空头平仓用buy
             side = 'sell' if position.get('side') == 'long' else 'buy'
             
-            logger.info(f"📝 准备平仓: {symbol} {side} 数量:{size:.6f}")
+            logger.info(f"📝 准备平仓: {symbol} {side} 数量:{size:.6f} 预计盈亏:{pnl:.2f}U")
             
             # 直接使用合约数量创建市价单
             order = self.exchange.create_market_order(symbol, side, size)
             
             if order['id']:
-                logger.info(f"✅ 成功平仓{symbol}，方向: {side}，数量: {size:.6f}")
+                logger.info(f"✅ 成功平仓{symbol}，方向: {side}，数量: {size:.6f}，盈亏: {pnl:.2f}U")
+                
+                # 记录交易统计
+                self.stats.add_trade(symbol, position_side, pnl)
+                
                 # 等待平仓成交后刷新持仓
                 time.sleep(2)
                 self.get_position(symbol, force_refresh=True)
+                
+                # 更新上次持仓状态
+                self.last_position_state[symbol] = 'none'
+                
                 return True
             else:
                 logger.error(f"❌ 平仓{symbol}失败")
@@ -431,7 +533,12 @@ class MACDStrategy:
                     return {'signal': 'hold', 'reason': '等待交叉信号'}
             
             else:  # 有持仓
-                if position['side'] == 'long':
+                current_position_side = position['side']
+                
+                # 检查持仓方向是否与上次记录一致，如果一致说明没有平仓过
+                last_side = self.last_position_state.get(symbol, 'none')
+                
+                if current_position_side == 'long':
                     # 多头平仓：快线下穿慢线（死叉）
                     if prev_macd >= prev_signal and current_macd < current_signal:
                         return {'signal': 'close', 'reason': '多头平仓（死叉）'}
@@ -452,7 +559,7 @@ class MACDStrategy:
     def execute_strategy(self):
         """执行策略"""
         logger.info("=" * 70)
-        logger.info("🚀 开始执行MACD策略 (25倍杠杆，无限制交易)")
+        logger.info("🚀 开始执行MACD策略 (25倍杠杆，15分钟周期)")
         logger.info("=" * 70)
         
         try:
@@ -463,6 +570,9 @@ class MACDStrategy:
             balance = self.get_account_balance()
             logger.info(f"💰 当前账户余额: {balance:.2f} USDT")
             
+            # 显示交易统计
+            logger.info(self.stats.get_summary())
+            
             # 分析所有交易对
             signals = {}
             for symbol in self.symbols:
@@ -472,7 +582,7 @@ class MACDStrategy:
                 
                 status_line = f"📊 {symbol}: 信号={signals[symbol]['signal']}, 原因={signals[symbol]['reason']}"
                 if position['size'] > 0:
-                    status_line += f", 持仓={position['side']} {position['size']:.6f} PNL={position['unrealized_pnl']:.2f}"
+                    status_line += f", 持仓={position['side']} {position['size']:.6f} PNL={position['unrealized_pnl']:.2f}U"
                 if open_orders:
                     status_line += f", 挂单={len(open_orders)}个"
                 
@@ -483,19 +593,34 @@ class MACDStrategy:
                 signal = signal_info['signal']
                 reason = signal_info['reason']
                 
+                # 获取当前持仓
+                current_position = self.get_position(symbol, force_refresh=False)
+                
                 if signal == 'buy':
+                    # 检查是否已经是多头持仓，如果是则不重复开仓
+                    if current_position['size'] > 0 and current_position['side'] == 'long':
+                        logger.info(f"ℹ️ {symbol}已有多头持仓，跳过重复开仓")
+                        continue
+                    
                     # 做多：金叉信号
                     amount = self.calculate_order_amount(symbol)
                     if amount > 0:
                         if self.create_order(symbol, 'buy', amount):
                             logger.info(f"🚀 开多{symbol}成功 - {reason}")
+                            self.last_position_state[symbol] = 'long'
                 
                 elif signal == 'sell':
+                    # 检查是否已经是空头持仓，如果是则不重复开仓
+                    if current_position['size'] > 0 and current_position['side'] == 'short':
+                        logger.info(f"ℹ️ {symbol}已有空头持仓，跳过重复开仓")
+                        continue
+                    
                     # 做空：死叉信号
                     amount = self.calculate_order_amount(symbol)
                     if amount > 0:
                         if self.create_order(symbol, 'sell', amount):
                             logger.info(f"📉 开空{symbol}成功 - {reason}")
+                            self.last_position_state[symbol] = 'short'
                 
                 elif signal == 'close':
                     # 平仓
@@ -513,10 +638,12 @@ class MACDStrategy:
         logger.info("🚀 MACD策略启动 - RAILWALL平台版")
         logger.info("=" * 70)
         logger.info(f"📈 MACD参数: 快线={self.fast_period}, 慢线={self.slow_period}, 信号线={self.signal_period}")
+        logger.info(f"📊 K线周期: {self.timeframe} (15分钟)")
         logger.info(f"💪 杠杆倍数: {self.leverage}倍")
         logger.info(f"⏰ 运行间隔: {interval}秒 ({interval/60:.1f}分钟)")
         logger.info(f"🔄 状态同步: 每{self.sync_interval}秒")
         logger.info(f"📊 监控币种: {', '.join(self.symbols)}")
+        logger.info(self.stats.get_summary())
         logger.info("=" * 70)
         
         while True:
