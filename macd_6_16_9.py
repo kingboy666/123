@@ -664,33 +664,94 @@ class MACDStrategy:
                 logger.warning(f"⚠️ {symbol}最终数量无效: {contract_size}")
                 return False
 
-            logger.info(f"📝 准备下单(OKX原生): {symbol} {side} 金额:{amount:.4f}U 价格:{current_price:.4f} 数量:{contract_size:.8f}")
-
-            # 使用 ccxt 统一下单接口（市场单），避免私有路由拼接异常
+            logger.info(f"📝 准备下单: {symbol} {side} 金额:{amount:.4f}U 价格:{current_price:.4f} 数量:{contract_size:.8f}")
             pos_side = 'long' if side == 'buy' else 'short'
-            params = {
-                'tdMode': 'cross',
-                'posSide': pos_side
-            }
-            resp = self.exchange.create_order(symbol, 'market', side, contract_size, None, params)
-
-            # 提取订单ID（兼容不同返回结构）
             order_id = None
-            if isinstance(resp, dict):
-                order_id = resp.get('id') or resp.get('orderId') or resp.get('ordId')
-            if not order_id and isinstance(resp, list) and resp:
-                maybe = resp[0]
-                if isinstance(maybe, dict):
-                    order_id = maybe.get('id') or maybe.get('orderId') or maybe.get('ordId')
+            last_err = None
+
+            # 打印当前 ccxt 版本配置，便于排查
+            try:
+                ex_ver = getattr(self.exchange, 'version', None)
+                opt_ver = (self.exchange.options or {}).get('version') if getattr(self.exchange, 'options', None) else None
+                logger.debug(f"🔧 CCXT version: {ex_ver}, options.version: {opt_ver}")
+            except Exception:
+                pass
+
+            import traceback
+
+            # 尝试1：统一接口 create_order
+            try:
+                params = {'tdMode': 'cross', 'posSide': pos_side}
+                resp = self.exchange.create_order(symbol, 'market', side, contract_size, None, params)
+                if isinstance(resp, dict):
+                    order_id = resp.get('id') or resp.get('orderId') or resp.get('ordId') or resp.get('clOrdId')
+                elif isinstance(resp, list) and resp and isinstance(resp[0], dict):
+                    order_id = resp[0].get('id') or resp[0].get('orderId') or resp[0].get('ordId') or resp[0].get('clOrdId')
+                if order_id:
+                    logger.info(f"✅ 成功创建{symbol} {side}订单，数量:{contract_size:.8f}，订单ID:{order_id}")
+                else:
+                    logger.warning(f"⚠️ create_order 返回未包含订单ID，响应: {resp}")
+            except Exception as e1:
+                last_err = e1
+                logger.error(f"❌ create_order 异常: {e1}")
+                logger.debug(traceback.format_exc())
+
+            # 尝试2：create_market_order（若尚未拿到ID）
+            if not order_id:
+                try:
+                    params = {'tdMode': 'cross', 'posSide': pos_side}
+                    resp = self.exchange.create_market_order(symbol, side, contract_size, params)
+                    if isinstance(resp, dict):
+                        order_id = resp.get('id') or resp.get('orderId') or resp.get('ordId') or resp.get('clOrdId')
+                    elif isinstance(resp, list) and resp and isinstance(resp[0], dict):
+                        order_id = resp[0].get('id') or resp[0].get('orderId') or resp[0].get('ordId') or resp[0].get('clOrdId')
+                    if order_id:
+                        logger.info(f"✅ 成功创建{symbol} {side}订单（market API），数量:{contract_size:.8f}，订单ID:{order_id}")
+                    else:
+                        logger.warning(f"⚠️ create_market_order 返回未包含订单ID，响应: {resp}")
+                except Exception as e2:
+                    last_err = e2
+                    logger.error(f"❌ create_market_order 异常: {e2}")
+                    logger.debug(traceback.format_exc())
+
+            # 尝试3：OKX 原生接口（最后兜底）
+            if not order_id:
+                try:
+                    inst_id = self.symbol_to_inst_id(symbol)
+                    raw_params = {
+                        'instId': inst_id,
+                        'tdMode': 'cross',
+                        'side': side,
+                        'posSide': pos_side,
+                        'ordType': 'market',
+                        'sz': str(contract_size)
+                    }
+                    resp = self.exchange.privatePostTradeOrder(raw_params)
+                    # 兼容 OKX v5 返回结构
+                    if isinstance(resp, dict):
+                        data = resp.get('data') or []
+                        if isinstance(data, list) and data:
+                            order_id = data[0].get('ordId') or data[0].get('clOrdId') or data[0].get('id')
+                        else:
+                            order_id = resp.get('ordId') or resp.get('clOrdId') or resp.get('id')
+                    if order_id:
+                        logger.info(f"✅ 成功创建{symbol} {side}订单（OKX原生兜底），数量:{contract_size:.8f}，订单ID:{order_id}")
+                    else:
+                        logger.error(f"❌ OKX原生下单无订单ID，响应: {resp}")
+                except Exception as e3:
+                    last_err = e3
+                    logger.error(f"❌ OKX原生下单异常: {e3}")
+                    logger.debug(traceback.format_exc())
 
             if order_id:
-                logger.info(f"✅ 成功创建{symbol} {side}订单，金额:{amount:.4f}U，数量:{contract_size:.8f}，订单ID:{order_id}")
                 time.sleep(2)
                 self.get_position(symbol, force_refresh=True)
                 return True
-            else:
-                logger.error(f"❌ 创建{symbol} {side}订单失败（未返回订单ID）")
-                return False
+
+            # 若三次都失败，抛出最后错误提示
+            if last_err:
+                logger.error(f"❌ 创建{symbol} {side}订单失败：{last_err}")
+            return False
 
         except Exception as e:
             logger.error(f"❌ 创建{symbol} {side}订单异常: {e}")
