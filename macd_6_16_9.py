@@ -1,4 +1,4 @@
-刷新的#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """MACD策略实现 - RAILWALL平台版本
 25倍杠杆，无限制交易，带挂单识别和状态同步
