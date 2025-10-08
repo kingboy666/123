@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+刷新的#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """MACD策略实现 - RAILWALL平台版本
 25倍杠杆，无限制交易，带挂单识别和状态同步
@@ -918,7 +918,7 @@ class MACDStrategy:
             logger.error(f"❌ 执行策略失败: {e}")
     
     def run_continuous(self, interval: int = 60):
-        """连续运行策略"""
+        """连续运行策略（改为北京时间整点刷新）"""
         logger.info("=" * 70)
         logger.info("🚀 MACD策略启动 - RAILWAY平台版 (小币种)")
         logger.info("=" * 70)
@@ -926,66 +926,30 @@ class MACDStrategy:
         logger.info(f"📊 K线周期: {self.timeframe} (15分钟)")
         lev_desc = ', '.join([f"{s.split('/')[0]}={self.symbol_leverage.get(s, 20)}x" for s in self.symbols])
         logger.info(f"💪 杠杆倍数: {lev_desc}")
-        logger.info(f"⏰ 运行间隔: {interval}秒 ({interval/60:.1f}分钟)")
+        logger.info("⏰ 刷新方式: 北京时间整点刷新（每小时00:00触发一次）")
         logger.info(f"🔄 状态同步: 每{self.sync_interval}秒")
         logger.info(f"📊 监控币种: {', '.join(self.symbols)}")
         logger.info(f"💡 小币种特性: 支持0.1U起的小额交易")
         logger.info(self.stats.get_summary())
         logger.info("=" * 70)
-        
-        # 对齐扫描参数（用于15分钟图：在每根K线收盘前1分钟开始扫描）
-        align_to_15m = os.environ.get('ALIGN_TO_15M', 'false').strip().lower() in ('1', 'true', 'yes')
-        try:
-            scan_window_sec = int(os.environ.get('SCAN_WINDOW_SEC', '60'))
-            scan_step_sec = int(os.environ.get('SCAN_STEP_SEC', '3'))
-        except Exception:
-            scan_window_sec = 60
-            scan_step_sec = 3
 
         china_tz = pytz.timezone('Asia/Shanghai')
 
-        def floor_to_15m(dt: datetime.datetime) -> datetime.datetime:
-            minute = (dt.minute // 15) * 15
-            return dt.replace(minute=minute, second=0, microsecond=0)
-
         while True:
             try:
-                if align_to_15m:
-                    now = datetime.datetime.now(china_tz)
-                    base = floor_to_15m(now)
-                    # 窗口在每个15分钟周期的第14分钟开始
-                    window_start = base + datetime.timedelta(minutes=14)
-                    if now >= base + datetime.timedelta(minutes=15):
-                        # 已过当前周期，滚动到下一个周期
-                        base = base + datetime.timedelta(minutes=15)
-                        window_start = base + datetime.timedelta(minutes=14)
-                    if now < window_start:
-                        sleep_sec = max(0.0, (window_start - now).total_seconds())
-                        logger.info(f"⏲️ 将在对齐窗口开始扫描: {window_start.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)，等待{int(sleep_sec)}秒...")
-                        time.sleep(sleep_sec)
+                # 计算下一个整点（北京时间）
+                now = datetime.datetime.now(china_tz)
+                next_top = (now.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1))
+                wait_sec = max(0.0, (next_top - now).total_seconds())
+                logger.info(f"⏳ 等待至下一个整点: {next_top.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)，约{int(wait_sec)}秒...")
+                time.sleep(wait_sec)
 
-                    # 窗口内连续扫描
-                    window_end = window_start + datetime.timedelta(seconds=scan_window_sec)
-                    logger.info(f"🔎 已进入窗口 [{window_start.strftime('%H:%M:%S')} ~ {window_end.strftime('%H:%M:%S')}]，步长{scan_step_sec}s")
-                    while datetime.datetime.now(china_tz) < window_end:
-                        self.execute_strategy()
-                        time.sleep(max(1, scan_step_sec))
+                # 到整点后执行一次策略
+                self.execute_strategy()
 
-                    # 窗口结束后，等待到下一个周期窗口
-                    next_base = base + datetime.timedelta(minutes=15)
-                    next_window_start = next_base + datetime.timedelta(minutes=14)
-                    wait_sec = max(0.0, (next_window_start - datetime.datetime.now(china_tz)).total_seconds())
-                    logger.info(f"⏳ 窗口结束，下一窗口 {next_window_start.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)，等待{int(wait_sec)}秒...")
-                    time.sleep(wait_sec)
-                else:
-                    start_ts = time.time()
-                    self.execute_strategy()
-                    next_run_ts = start_ts + interval
-                    next_run_dt = datetime.datetime.fromtimestamp(next_run_ts, tz=china_tz)
-                    logger.info(f"⏳ 等待下次执行，间隔{interval}秒 ({interval/60:.1f}分钟)，预计: {next_run_dt.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
-                    logger.info("")
-                    time.sleep(interval)
-                
+                # 若执行很快，可能仍处于同一秒，为避免重复触发，轻微等待1秒
+                time.sleep(1)
+
             except KeyboardInterrupt:
                 logger.info("⛔ 用户中断，策略停止")
                 break
