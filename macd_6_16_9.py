@@ -155,9 +155,9 @@ class MACDStrategy:
         self.timeframe = '15m'
         
         # MACD参数
-        self.fast_period = 12
-        self.slow_period = 26
-        self.signal_period = 9
+        self.fast_period = 10
+        self.slow_period = 40
+        self.signal_period = 15
         
         # 杠杆配置 - 分币种设置
         self.symbol_leverage: Dict[str, int] = {
