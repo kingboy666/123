@@ -204,8 +204,8 @@ class MACDStrategy:
             
             # 尝试设置合约模式（如果有持仓会失败，但不影响运行）
             try:
-                self.exchange.set_position_mode(False)  # 单向持仓模式
-                logger.info("✅ 设置为单向持仓模式")
+                self.exchange.set_position_mode(True)  # 双向持仓（多空分开）
+                logger.info("✅ 设置为双向持仓模式（多空分开）")
             except Exception as e:
                 logger.warning(f"⚠️ 设置持仓模式失败（当前可能有持仓，跳过设置）")
                 logger.info("ℹ️ 程序将继续运行，使用当前持仓模式")
@@ -592,8 +592,8 @@ class MACDStrategy:
             logger.error(f"❌ 创建{symbol} {side}订单异常: {e}")
             return False
     
-    def close_position(self, symbol: str) -> bool:
-        """平仓"""
+    def close_position(self, symbol: str, open_reverse: bool = False) -> bool:
+        """平仓；如 open_reverse=True，平仓后立即反向开仓"""
         try:
             # 先取消所有挂单
             if self.has_open_orders(symbol):
@@ -620,8 +620,8 @@ class MACDStrategy:
             
             logger.info(f"📝 准备平仓: {symbol} {side} 数量:{size:.6f} 预计盈亏:{pnl:.2f}U")
             
-            # 直接使用合约数量创建市价单
-            order = self.exchange.create_market_order(symbol, side, size)
+            # 使用reduceOnly参数以确保只是平仓
+            order = self.exchange.create_market_order(symbol, side, size, {'reduceOnly': True})
             
             if order['id']:
                 logger.info(f"✅ 成功平仓{symbol}，方向: {side}，数量: {size:.6f}，盈亏: {pnl:.2f}U")
@@ -635,6 +635,14 @@ class MACDStrategy:
                 
                 # 更新上次持仓状态
                 self.last_position_state[symbol] = 'none'
+
+                # 平仓后根据需要反向开仓
+                if open_reverse:
+                    reverse_side = 'sell' if position_side == 'long' else 'buy'
+                    amount = self.calculate_order_amount(symbol)
+                    if amount > 0:
+                        if self.create_order(symbol, reverse_side, amount):
+                            logger.info(f"🔁 平仓后已反向开仓 {symbol} -> {reverse_side}")
                 
                 return True
             else:
@@ -815,9 +823,9 @@ class MACDStrategy:
                             self.last_position_state[symbol] = 'short'
                 
                 elif signal == 'close':
-                    # 平仓
-                    if self.close_position(symbol):
-                        logger.info(f"✅ 平仓{symbol}成功 - {reason}")
+                    # 平仓并反手开仓
+                    if self.close_position(symbol, open_reverse=True):
+                        logger.info(f"✅ 平仓并反手开仓 {symbol} 成功 - {reason}")
             
             logger.info("=" * 70)
                         
