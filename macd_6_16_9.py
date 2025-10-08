@@ -206,6 +206,13 @@ class MACDStrategy:
                 self.exchange.version = 'v5'
             except Exception:
                 pass
+            # 统一默认类型与结算币种，减少内部推断
+            try:
+                opts = self.exchange.options or {}
+                opts.update({'defaultType': 'swap', 'defaultSettle': 'USDT'})
+                self.exchange.options = opts
+            except Exception:
+                pass
             logger.info("✅ API连接验证成功")
             
             # 同步交易所时间
@@ -218,11 +225,20 @@ class MACDStrategy:
             except Exception as e:
                 logger.warning(f"⚠️ 预加载市场数据失败，将使用安全回退: {e}")
             
-            # 按交易对设置杠杆（OKX参数为 mgnMode 而非 marginMode）
+            # 按交易对设置杠杆（使用OKX原生接口，避免统一封装问题）
             for symbol in self.symbols:
                 try:
                     lev = self.symbol_leverage.get(symbol, 20)
-                    self.exchange.set_leverage(lev, symbol, {'mgnMode': 'cross'})
+                    inst_id = self.symbol_to_inst_id(symbol)
+                    # 分别设置多空两边的杠杆
+                    try:
+                        self.exchange.privatePostAccountSetLeverage({'instId': inst_id, 'lever': str(lev), 'mgnMode': 'cross', 'posSide': 'long'})
+                    except Exception:
+                        pass
+                    try:
+                        self.exchange.privatePostAccountSetLeverage({'instId': inst_id, 'lever': str(lev), 'mgnMode': 'cross', 'posSide': 'short'})
+                    except Exception:
+                        pass
                     logger.info(f"✅ 设置{symbol}杠杆为{lev}倍")
                 except Exception as e:
                     logger.warning(f"⚠️ 设置{symbol}杠杆失败（可能已设置）: {e}")
@@ -243,38 +259,39 @@ class MACDStrategy:
         """加载市场信息（获取最小下单量等限制）"""
         try:
             logger.info("🔄 加载市场信息...")
-            try:
-                markets = self.exchange.load_markets({'type': 'swap'})
-            except Exception as e:
-                logger.warning(f"⚠️ 加载市场信息失败，使用回退参数: {e}")
-                markets = {}
-            
+            # 使用 OKX v5 原生接口获取合约规格，避免统一封装
+            resp = self.exchange.publicGetPublicInstruments({'instType': 'SWAP'})
+            data = resp.get('data') if isinstance(resp, dict) else resp
+            # 建立 instId -> 规格 映射
+            spec_map = {}
+            for it in (data or []):
+                if it.get('settleCcy') == 'USDT':  # 仅 USDT 结算
+                    spec_map[it.get('instId')] = it
             for symbol in self.symbols:
-                if symbol in markets:
-                    market = markets[symbol]
-                    # 优先从limits读取，其次从info中的细粒度定义读取
-                    min_amount = float((market.get('limits') or {}).get('amount', {}).get('min') or 0) or \
-                                 float((market.get('info') or {}).get('minSz') or 0) or \
-                                 float((market.get('info') or {}).get('lotSz') or 0) or 0.0
-                    lot_size = float((market.get('info') or {}).get('lotSz') or 0) or 0.0
-                    self.markets_info[symbol] = {
-                        'min_amount': min_amount if min_amount > 0 else 0.000001,
-                        'min_cost': float((market.get('limits') or {}).get('cost', {}).get('min') or 0) or 0.0,
-                        'amount_precision': market['precision']['amount'],
-                        'price_precision': market['precision']['price'],
-                        'lot_size': lot_size if lot_size > 0 else None,
-                    }
-                    logger.info(f"📊 {symbol} - 最小数量:{self.markets_info[symbol]['min_amount']:.8f}, 最小金额:{self.markets_info[symbol]['min_cost']:.4f}U")
-            
+                inst_id = self.symbol_to_inst_id(symbol)
+                it = spec_map.get(inst_id, {})
+                # 解析规格
+                min_sz = float(it.get('minSz') or 0) or 0.000001
+                lot_sz = float(it.get('lotSz') or 0) or None
+                tick_sz = float(it.get('tickSz') or 0) or 0.0001
+                amt_prec = len(str(lot_sz).split('.')[-1]) if lot_sz and '.' in str(lot_sz) else 8
+                px_prec = len(str(tick_sz).split('.')[-1]) if '.' in str(tick_sz) else 4
+                self.markets_info[symbol] = {
+                    'min_amount': min_sz,
+                    'min_cost': 0.0,
+                    'amount_precision': amt_prec,
+                    'price_precision': px_prec,
+                    'lot_size': lot_sz,
+                }
+                logger.info(f"📊 {symbol} - 最小数量:{min_sz:.8f} 步进:{(lot_sz or 0):.8f} Tick:{tick_sz:.8f}")
             logger.info("✅ 市场信息加载完成")
-            
         except Exception as e:
             logger.error(f"❌ 加载市场信息失败: {e}")
             # 小币种设置更宽松的默认值
             for symbol in self.symbols:
                 self.markets_info[symbol] = {
                     'min_amount': 0.000001,
-                    'min_cost': 0.1,  # 小币种最小0.1U（仅提示，不做强校验）
+                    'min_cost': 0.1,
                     'amount_precision': 8,
                     'price_precision': 4,
                     'lot_size': None,
@@ -474,18 +491,26 @@ class MACDStrategy:
             self.sync_all_status()
     
     def get_account_balance(self) -> float:
-        """获取账户余额"""
+        """获取账户余额（OKX原生接口）"""
         try:
-            balance = self.exchange.fetch_balance({'type': 'swap'})
-            free_balance = float(balance['USDT']['free'])
-            total_balance = float(balance['USDT']['total'])
-            used_balance = float(balance['USDT']['used'])
-            
-            logger.debug(f"💰 余额 - 可用: {free_balance:.2f} 总额: {total_balance:.2f} 占用: {used_balance:.2f}")
-            return free_balance
+            resp = self.exchange.privateGetAccountBalance({})
+            data = resp.get('data') if isinstance(resp, dict) else resp
+            # data 结构: [{ details: [{ccy:'USDT', cashBal:'...', availBal:'...'}], ... }]
+            avail = 0.0
+            for acc in (data or []):
+                for d in (acc.get('details') or []):
+                    if d.get('ccy') == 'USDT':
+                        # 优先 availBal，其次 cashBal
+                        v = d.get('availBal') or d.get('cashBal') or '0'
+                        try:
+                            avail = float(v)
+                        except Exception:
+                            avail = 0.0
+                        break
+            return avail
         except Exception as e:
             logger.error(f"❌ 获取账户余额失败: {e}")
-            return 0
+            return 0.0
     
     def get_klines(self, symbol: str, limit: int = 100) -> List[Dict]:
         """获取K线数据 - 15分钟周期"""
