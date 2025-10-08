@@ -627,9 +627,26 @@ class MACDStrategy:
             amount_precision = int(market_info.get('amount_precision', 8) or 8)
             lot_sz = market_info.get('lot_size')  # 可能为 None
 
-            # 获取当前价格
-            ticker = self.exchange.fetch_ticker(symbol)
-            current_price = float(ticker['last'])
+            # 获取当前价格（使用 OKX v5 原生接口，避免 ccxt 统一接口的 None + 'str' 问题）
+            inst_id = self.symbol_to_inst_id(symbol)
+            try:
+                tkr = self.exchange.publicGetMarketTicker({'instId': inst_id})
+                # OKX v5 返回结构 { code, data: [{ last: '...', ... }], msg }
+                if isinstance(tkr, dict):
+                    d = tkr.get('data') or []
+                    if isinstance(d, list) and d:
+                        current_price = float(d[0].get('last') or d[0].get('lastPx') or 0.0)
+                    else:
+                        current_price = 0.0
+                else:
+                    current_price = 0.0
+            except Exception as _e:
+                logger.error(f"❌ 获取{symbol}最新价失败({inst_id}): {_e}")
+                current_price = 0.0
+
+            if not current_price or current_price <= 0:
+                logger.error(f"❌ 无法获取{symbol}有效价格，跳过下单")
+                return False
 
             # 计算合约数量（基于金额/价格）
             contract_size = amount / current_price
@@ -755,6 +772,8 @@ class MACDStrategy:
 
         except Exception as e:
             logger.error(f"❌ 创建{symbol} {side}订单异常: {e}")
+            import traceback as _tb
+            logger.debug(_tb.format_exc())
             return False
     
     def close_position(self, symbol: str, open_reverse: bool = False) -> bool:
