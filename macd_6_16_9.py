@@ -591,22 +591,23 @@ class MACDStrategy:
             return False
     
     def calculate_order_amount(self, symbol: str) -> float:
-        """计算下单金额（使用总余额平均分配）"""
+        """计算下单金额（使用总余额平均分配到各交易对，使用 position_percentage 比例）"""
         try:
             balance = self.get_account_balance()
-            # 使用100%余额
             total_amount = balance * self.position_percentage
-            
-            # 平均分配到4个交易对
-            allocated_amount = total_amount / len(self.symbols)
-            
-            # 小币种：只要有余额就下单，不设最小限制
-            logger.debug(f"💵 {symbol}分配金额: {allocated_amount:.4f}U (总余额: {balance:.2f}U)")
+            num_symbols = max(1, len(self.symbols))
+            allocated_amount = total_amount / num_symbols
+
+            if allocated_amount <= 0:
+                logger.warning(f"⚠️ 可用余额不足，无法为 {symbol} 分配下单金额 (余额:{balance:.4f}U, 使用比例:{self.position_percentage:.2f})")
+                return 0.0
+
+            logger.info(f"💵 资金分配: 总余额={balance:.4f}U, 使用比例={self.position_percentage:.2f}, 每币分配={allocated_amount:.4f}U")
             return allocated_amount
-            
+
         except Exception as e:
             logger.error(f"❌ 计算{symbol}下单金额失败: {e}")
-            return 0
+            return 0.0
     
     def create_order(self, symbol: str, side: str, amount: float) -> bool:
         """创建订单 - 小币种版本，支持小额交易（OKX原生下单，避免精度与symbol转换问题）"""
@@ -803,35 +804,83 @@ class MACDStrategy:
             side = 'sell' if position.get('side') == 'long' else 'buy'
             
             logger.info(f"📝 准备平仓: {symbol} {side} 数量:{size:.6f} 预计盈亏:{pnl:.2f}U")
-            
-            # 使用reduceOnly参数以确保只是平仓；OKX 需指定当前持仓方向的 posSide
-            order = self.exchange.create_market_order(symbol, side, size, {'reduceOnly': True, 'posSide': position_side, 'tdMode': 'cross'})
-            
-            if order['id']:
+
+            import traceback as _tb
+            order_id = None
+            last_err = None
+
+            # 尝试1：ccxt 统一接口 create_order + reduceOnly
+            try:
+                params = {'reduceOnly': True, 'posSide': position_side, 'tdMode': 'cross'}
+                resp = self.exchange.create_order(symbol, 'market', side, size, None, params)
+                if isinstance(resp, dict):
+                    order_id = resp.get('id') or resp.get('orderId') or resp.get('ordId') or resp.get('clOrdId')
+                elif isinstance(resp, list) and resp and isinstance(resp[0], dict):
+                    order_id = resp[0].get('id') or resp[0].get('orderId') or resp[0].get('ordId') or resp[0].get('clOrdId')
+            except Exception as e1:
+                last_err = e1
+                logger.error(f"❌ 平仓 create_order 异常: {e1}")
+                logger.debug(_tb.format_exc())
+
+            # 尝试2：ccxt create_market_order + reduceOnly
+            if not order_id:
+                try:
+                    params = {'reduceOnly': True, 'posSide': position_side, 'tdMode': 'cross'}
+                    resp = self.exchange.create_market_order(symbol, side, size, params)
+                    if isinstance(resp, dict):
+                        order_id = resp.get('id') or resp.get('orderId') or resp.get('ordId') or resp.get('clOrdId')
+                    elif isinstance(resp, list) and resp and isinstance(resp[0], dict):
+                        order_id = resp[0].get('id') or resp[0].get('orderId') or resp[0].get('ordId') or resp[0].get('clOrdId')
+                except Exception as e2:
+                    last_err = e2
+                    logger.error(f"❌ 平仓 create_market_order 异常: {e2}")
+                    logger.debug(_tb.format_exc())
+
+            # 尝试3：OKX 原生接口兜底
+            if not order_id:
+                try:
+                    inst_id = self.symbol_to_inst_id(symbol)
+                    raw_params = {
+                        'instId': inst_id,
+                        'tdMode': 'cross',
+                        'side': side,
+                        'posSide': position_side,
+                        'reduceOnly': True,
+                        'ordType': 'market',
+                        'sz': str(size)
+                    }
+                    resp = self.exchange.privatePostTradeOrder(raw_params)
+                    if isinstance(resp, dict):
+                        data = resp.get('data') or []
+                        if isinstance(data, list) and data:
+                            order_id = data[0].get('ordId') or data[0].get('clOrdId') or data[0].get('id')
+                        else:
+                            order_id = resp.get('ordId') or resp.get('clOrdId') or resp.get('id')
+                except Exception as e3:
+                    last_err = e3
+                    logger.error(f"❌ 平仓 OKX 原生接口异常: {e3}")
+                    logger.debug(_tb.format_exc())
+
+            if order_id:
                 logger.info(f"✅ 成功平仓{symbol}，方向: {side}，数量: {size:.6f}，盈亏: {pnl:.2f}U")
-                
                 # 记录交易统计
                 self.stats.add_trade(symbol, position_side, pnl)
-                
-                # 等待平仓成交后刷新持仓
                 time.sleep(2)
                 self.get_position(symbol, force_refresh=True)
-                
-                # 更新上次持仓状态
                 self.last_position_state[symbol] = 'none'
 
-                # 平仓后根据需要反向开仓
                 if open_reverse:
                     reverse_side = 'sell' if position_side == 'long' else 'buy'
                     amount = self.calculate_order_amount(symbol)
                     if amount > 0:
                         if self.create_order(symbol, reverse_side, amount):
                             logger.info(f"🔁 平仓后已反向开仓 {symbol} -> {reverse_side}")
-                
                 return True
-            else:
-                logger.error(f"❌ 平仓{symbol}失败")
-                return False
+
+            logger.error(f"❌ 平仓{symbol}失败")
+            if last_err:
+                logger.error(f"❌ 平仓最后错误：{last_err}")
+            return False
                 
         except Exception as e:
             logger.error(f"❌ 平仓{symbol}失败: {e}")
@@ -882,8 +931,8 @@ class MACDStrategy:
             macd_current = self.calculate_macd(closes)
             macd_prev = self.calculate_macd(closes[:-1])
             
-            # 获取持仓（使用缓存，避免频繁请求）
-            position = self.get_position(symbol, force_refresh=False)
+            # 获取持仓（强制刷新，确保信号判断基于最新持仓）
+            position = self.get_position(symbol, force_refresh=True)
             
             # 使用实时K线进行交叉与柱状图颜色变化判断
             prev_macd = macd_prev['macd']
@@ -977,8 +1026,8 @@ class MACDStrategy:
                 signal = signal_info['signal']
                 reason = signal_info['reason']
                 
-                # 获取当前持仓
-                current_position = self.get_position(symbol, force_refresh=False)
+                # 获取当前持仓（强制刷新，确保动作基于最新状态）
+                current_position = self.get_position(symbol, force_refresh=True)
                 
                 if signal == 'buy':
                     # 检查是否已经是多头持仓，如果是则不重复开仓
