@@ -145,8 +145,13 @@ class MACDStrategy:
         self.slow_period = 16
         self.signal_period = 9
         
-        # 杠杆配置 - 固定20倍
-        self.leverage = 20
+        # 杠杆配置 - 分币种设置
+        self.symbol_leverage: Dict[str, int] = {
+            'FIL/USDT:USDT': 30,
+            'WIF/USDT:USDT': 30,
+            'WLD/USDT:USDT': 30,
+            'ZRO/USDT:USDT': 20,
+        }
         
         # 仓位配置 - 使用100%资金
         self.position_percentage = 1.0
@@ -188,11 +193,12 @@ class MACDStrategy:
             # 同步交易所时间
             self.sync_exchange_time()
             
-            # 设置杠杆为25倍
+            # 按交易对设置杠杆
             for symbol in self.symbols:
                 try:
-                    self.exchange.set_leverage(self.leverage, symbol, {'marginMode': 'cross'})
-                    logger.info(f"✅ 设置{symbol}杠杆为{self.leverage}倍")
+                    lev = self.symbol_leverage.get(symbol, 20)
+                    self.exchange.set_leverage(lev, symbol, {'marginMode': 'cross'})
+                    logger.info(f"✅ 设置{symbol}杠杆为{lev}倍")
                 except Exception as e:
                     logger.warning(f"⚠️ 设置{symbol}杠杆失败（可能已设置）: {e}")
             
@@ -217,11 +223,17 @@ class MACDStrategy:
             for symbol in self.symbols:
                 if symbol in markets:
                     market = markets[symbol]
+                    # 优先从limits读取，其次从info中的细粒度定义读取
+                    min_amount = float((market.get('limits') or {}).get('amount', {}).get('min') or 0) or \
+                                 float((market.get('info') or {}).get('minSz') or 0) or \
+                                 float((market.get('info') or {}).get('lotSz') or 0) or 0.0
+                    lot_size = float((market.get('info') or {}).get('lotSz') or 0) or 0.0
                     self.markets_info[symbol] = {
-                        'min_amount': float(market['limits']['amount']['min'] or 0),
-                        'min_cost': float(market['limits']['cost']['min'] or 0),
+                        'min_amount': min_amount if min_amount > 0 else 0.000001,
+                        'min_cost': float((market.get('limits') or {}).get('cost', {}).get('min') or 0) or 0.0,
                         'amount_precision': market['precision']['amount'],
                         'price_precision': market['precision']['price'],
+                        'lot_size': lot_size if lot_size > 0 else None,
                     }
                     logger.info(f"📊 {symbol} - 最小数量:{self.markets_info[symbol]['min_amount']:.8f}, 最小金额:{self.markets_info[symbol]['min_cost']:.4f}U")
             
@@ -232,10 +244,11 @@ class MACDStrategy:
             # 小币种设置更宽松的默认值
             for symbol in self.symbols:
                 self.markets_info[symbol] = {
-                    'min_amount': 0.001,
-                    'min_cost': 0.1,  # 小币种最小0.1U
+                    'min_amount': 0.000001,
+                    'min_cost': 0.1,  # 小币种最小0.1U（仅提示，不做强校验）
                     'amount_precision': 8,
                     'price_precision': 4,
+                    'lot_size': None,
                 }
     
     def sync_exchange_time(self):
@@ -534,16 +547,31 @@ class MACDStrategy:
             ticker = self.exchange.fetch_ticker(symbol)
             current_price = float(ticker['last'])
             
-            # 计算合约数量
+            # 计算合约数量（基于金额/价格），再按精度与最小数量修正
             contract_size = amount / current_price
-            
-            # 检查数量是否满足最小限制（只检查数量，不检查金额）
+
+            # 最小数量与步进修正
             if contract_size < min_amount:
-                logger.warning(f"⚠️ {symbol}下单数量{contract_size:.8f}小于最小限制{min_amount:.8f}，跳过")
+                contract_size = min_amount
+
+            # 使用交易所精度函数确保合法
+            try:
+                contract_size = float(self.exchange.amount_to_precision(symbol, contract_size))
+            except Exception:
+                contract_size = round(contract_size, amount_precision)
+
+            # 防止被精度截断为0
+            if contract_size <= 0:
+                contract_size = max(min_amount, 10 ** (-amount_precision))
+                try:
+                    contract_size = float(self.exchange.amount_to_precision(symbol, contract_size))
+                except Exception:
+                    contract_size = round(contract_size, amount_precision)
+
+            # 再次确保不低于最小数量
+            if contract_size < min_amount:
+                logger.warning(f"⚠️ {symbol}数量在精度修正后仍低于最小限制: {contract_size:.8f} < {min_amount:.8f}")
                 return False
-            
-            # 根据精度调整数量
-            contract_size = round(contract_size, amount_precision)
             
             logger.info(f"📝 准备下单: {symbol} {side} 金额:{amount:.4f}U 价格:{current_price:.4f} 数量:{contract_size:.8f}")
             
@@ -652,36 +680,37 @@ class MACDStrategy:
             if not klines:
                 return {'signal': 'hold', 'reason': '数据获取失败'}
             
-            # 提取收盘价
+            # 提取收盘价（包含最新正在形成的K线）
             closes = [kline['close'] for kline in klines]
-            
-            # 计算MACD
-            macd_data = self.calculate_macd(closes)
+
+            if len(closes) < 2:
+                return {'signal': 'hold', 'reason': '数据不足'}
+
+            # 使用实时K线：当前与前一根（不等待收盘）
+            macd_current = self.calculate_macd(closes)
+            macd_prev = self.calculate_macd(closes[:-1])
             
             # 获取持仓（使用缓存，避免频繁请求）
             position = self.get_position(symbol, force_refresh=False)
             
-            # 获取前一根K线的MACD数据用于判断交叉
-            if len(closes) > 1:
-                prev_macd_data = self.calculate_macd(closes[:-1])
-                prev_macd = prev_macd_data['macd']
-                prev_signal = prev_macd_data['signal']
-            else:
-                return {'signal': 'hold', 'reason': '数据不足'}
+            # 使用实时K线进行交叉与柱状图颜色变化判断
+            prev_macd = macd_prev['macd']
+            prev_signal = macd_prev['signal']
+            prev_hist = macd_prev['histogram']
+            current_macd = macd_current['macd']
+            current_signal = macd_current['signal']
+            current_hist = macd_current['histogram']
             
-            current_macd = macd_data['macd']
-            current_signal = macd_data['signal']
-            
-            logger.debug(f"📊 {symbol} MACD - 当前: MACD={current_macd:.6f}, Signal={current_signal:.6f}, Hist={macd_data['histogram']:.6f}")
+            logger.debug(f"📊 {symbol} MACD(实时) - 当前: MACD={current_macd:.6f}, Signal={current_signal:.6f}, Hist={current_hist:.6f}")
             
             # 生成交易信号
             if position['size'] == 0:  # 无持仓
-                # 金叉信号：快线上穿慢线（做多）
-                if prev_macd <= prev_signal and current_macd > current_signal:
+                # 金叉信号：快线上穿慢线 或 柱状图由绿转红（负到正）
+                if (prev_macd <= prev_signal and current_macd > current_signal) or (prev_hist <= 0 and current_hist > 0):
                     return {'signal': 'buy', 'reason': 'MACD金叉（快线上穿慢线）'}
                 
-                # 死叉信号：快线下穿慢线（做空）
-                elif prev_macd >= prev_signal and current_macd < current_signal:
+                # 死叉信号：快线下穿慢线 或 柱状图由红转绿（正到负）
+                elif (prev_macd >= prev_signal and current_macd < current_signal) or (prev_hist >= 0 and current_hist < 0):
                     return {'signal': 'sell', 'reason': 'MACD死叉（快线下穿慢线）'}
                 
                 else:
@@ -694,15 +723,15 @@ class MACDStrategy:
                 last_side = self.last_position_state.get(symbol, 'none')
                 
                 if current_position_side == 'long':
-                    # 多头平仓：快线下穿慢线（死叉）
-                    if prev_macd >= prev_signal and current_macd < current_signal:
+                    # 多头平仓：快线下穿慢线 或 柱状图转负
+                    if (prev_macd >= prev_signal and current_macd < current_signal) or (current_hist < 0):
                         return {'signal': 'close', 'reason': '多头平仓（死叉）'}
                     else:
                         return {'signal': 'hold', 'reason': '持有多头'}
                 
                 else:  # short
-                    # 空头平仓：快线上穿慢线（金叉）
-                    if prev_macd <= prev_signal and current_macd > current_signal:
+                    # 空头平仓：快线上穿慢线 或 柱状图转正
+                    if (prev_macd <= prev_signal and current_macd > current_signal) or (current_hist > 0):
                         return {'signal': 'close', 'reason': '空头平仓（金叉）'}
                     else:
                         return {'signal': 'hold', 'reason': '持有空头'}
@@ -714,7 +743,7 @@ class MACDStrategy:
     def execute_strategy(self):
         """执行策略"""
         logger.info("=" * 70)
-        logger.info("🚀 开始执行MACD策略 (25倍杠杆，15分钟周期)")
+        logger.info("🚀 开始执行MACD策略 (分币种杠杆，15分钟周期)")
         logger.info("=" * 70)
         
         try:
@@ -802,7 +831,8 @@ class MACDStrategy:
         logger.info("=" * 70)
         logger.info(f"📈 MACD参数: 快线={self.fast_period}, 慢线={self.slow_period}, 信号线={self.signal_period}")
         logger.info(f"📊 K线周期: {self.timeframe} (15分钟)")
-        logger.info(f"💪 杠杆倍数: {self.leverage}倍")
+        lev_desc = ', '.join([f"{s.split('/')[0]}={self.symbol_leverage.get(s, 20)}x" for s in self.symbols])
+        logger.info(f"💪 杠杆倍数: {lev_desc}")
         logger.info(f"⏰ 运行间隔: {interval}秒 ({interval/60:.1f}分钟)")
         logger.info(f"🔄 状态同步: 每{self.sync_interval}秒")
         logger.info(f"📊 监控币种: {', '.join(self.symbols)}")
