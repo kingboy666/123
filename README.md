@@ -77,6 +77,12 @@ OKX_PASSPHRASE=your_passphrase
 # 可选配置
 # 每次扫描的时间间隔（秒）。为 1 表示每秒刷新。已在部署配置中默认设为 1。
 SCAN_INTERVAL=1
+
+# 仅用 OKX 原生接口，避免 ccxt 统一接口在部分路由上的拼接错误
+USE_OKX_NATIVE_ONLY=1
+
+# 每币最低 USDT 成本下限（避免连手续费都不够），可按需调整
+PER_SYMBOL_MIN_USDT=5
 ```
 
 ## 安全特性

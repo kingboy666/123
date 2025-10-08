@@ -717,6 +717,13 @@ class MACDStrategy:
                 return False
 
             logger.info(f"📝 准备下单: {symbol} {side} 金额:{amount:.4f}U 价格:{current_price:.4f} 数量:{contract_size:.8f}")
+            # 成本对齐信息（用于核对是否用满分配金额）
+            try:
+                est_cost = contract_size * current_price
+                logger.info(f"🧮 下单成本对齐: 分配金额={amount:.4f}U | 预计成本={est_cost:.4f}U | 数量={contract_size:.8f} | minSz={min_amount} | lotSz={lot_sz}")
+            except Exception:
+                pass
+
             pos_side = 'long' if side == 'buy' else 'short'
             order_id = None
             last_err = None
@@ -731,25 +738,33 @@ class MACDStrategy:
 
             import traceback
 
-            # 尝试1：统一接口 create_order
+            # 可选：仅用原生接口（通过环境变量控制）
+            native_only = False
             try:
-                params = {'tdMode': 'cross', 'posSide': pos_side}
-                resp = self.exchange.create_order(symbol, 'market', side, contract_size, None, params)
-                if isinstance(resp, dict):
-                    order_id = resp.get('id') or resp.get('orderId') or resp.get('ordId') or resp.get('clOrdId')
-                elif isinstance(resp, list) and resp and isinstance(resp[0], dict):
-                    order_id = resp[0].get('id') or resp[0].get('orderId') or resp[0].get('ordId') or resp[0].get('clOrdId')
-                if order_id:
-                    logger.info(f"✅ 成功创建{symbol} {side}订单，数量:{contract_size:.8f}，订单ID:{order_id}")
-                else:
-                    logger.warning(f"⚠️ create_order 返回未包含订单ID，响应: {resp}")
-            except Exception as e1:
-                last_err = e1
-                logger.error(f"❌ create_order 异常: {e1}")
-                logger.debug(traceback.format_exc())
+                native_only = (os.environ.get('USE_OKX_NATIVE_ONLY', '').strip().lower() in ('1', 'true', 'yes'))
+            except Exception:
+                native_only = False
 
-            # 尝试2：create_market_order（若尚未拿到ID）
-            if not order_id:
+            # 尝试1：统一接口 create_order（若未启用仅原生）
+            if not native_only:
+                try:
+                    params = {'tdMode': 'cross', 'posSide': pos_side}
+                    resp = self.exchange.create_order(symbol, 'market', side, contract_size, None, params)
+                    if isinstance(resp, dict):
+                        order_id = resp.get('id') or resp.get('orderId') or resp.get('ordId') or resp.get('clOrdId')
+                    elif isinstance(resp, list) and resp and isinstance(resp[0], dict):
+                        order_id = resp[0].get('id') or resp[0].get('orderId') or resp[0].get('ordId') or resp[0].get('clOrdId')
+                    if order_id:
+                        logger.info(f"✅ 成功创建{symbol} {side}订单，数量:{contract_size:.8f}，订单ID:{order_id}")
+                    else:
+                        logger.warning(f"⚠️ create_order 返回未包含订单ID，响应: {resp}")
+                except Exception as e1:
+                    last_err = e1
+                    logger.error(f"❌ create_order 异常: {e1}")
+                    logger.debug(traceback.format_exc())
+
+            # 尝试2：create_market_order（若尚未拿到ID且未启用仅原生）
+            if not order_id and not native_only:
                 try:
                     params = {'tdMode': 'cross', 'posSide': pos_side}
                     resp = self.exchange.create_market_order(symbol, side, contract_size, params)
