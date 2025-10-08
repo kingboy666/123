@@ -590,18 +590,64 @@ class MACDStrategy:
             logger.error(f"❌ 检查挂单失败: {e}")
             return False
     
-    def calculate_order_amount(self, symbol: str) -> float:
-        """计算下单金额（总余额平均分成4份，每币用一份余额下单）"""
+    def calculate_order_amount(self, symbol: str, active_count: Optional[int] = None) -> float:
+        """计算下单金额（增强版：支持固定目标金额/放大因子/上下限/按信号集中分配）"""
         try:
-            balance = self.get_account_balance()
-            num_symbols = max(1, len(self.symbols))
-            allocated_amount = balance / num_symbols  # 平均分4份
+            # 1) 固定目标名义金额（最高优先）
+            target_str = os.environ.get('TARGET_NOTIONAL_USDT', '').strip()
+            if target_str:
+                try:
+                    target = max(0.0, float(target_str))
+                    logger.info(f"💵 使用固定目标名义金额: {target:.4f}U")
+                    return target
+                except Exception:
+                    logger.warning(f"⚠️ TARGET_NOTIONAL_USDT 无效: {target_str}")
 
-            if allocated_amount <= 0:
+            # 2) 基于余额分配（默认平均分）
+            balance = self.get_account_balance()
+            if balance <= 0:
                 logger.warning(f"⚠️ 余额不足，无法为 {symbol} 分配资金 (余额:{balance:.4f}U)")
                 return 0.0
 
-            logger.info(f"💵 资金分配: 总余额={balance:.4f}U, 每币分配={allocated_amount:.4f}U (共{num_symbols}币)")
+            alloc_mode = (os.environ.get('ALLOC_MODE', 'all') or 'all').strip().lower()
+            num_symbols = max(1, len(self.symbols))
+            base_divisor = num_symbols
+
+            # 仅给有信号的币分配（需要调用处统计 active_count 并传入）
+            if alloc_mode == 'signals' and active_count and active_count > 0:
+                base_divisor = active_count
+
+            allocated_amount = balance / max(1, base_divisor)
+
+            # 3) 放大因子
+            factor_str = os.environ.get('ORDER_NOTIONAL_FACTOR', '50').strip()
+            try:
+                factor = max(1.0, float(factor_str or '1'))
+            except Exception:
+                factor = 1.0
+            allocated_amount *= factor
+
+            # 4) 下限/上限
+            def _to_float(env_name: str, default: float) -> float:
+                try:
+                    s = os.environ.get(env_name, '').strip()
+                    return float(s) if s else default
+                except Exception:
+                    return default
+
+            min_floor = max(0.0, _to_float('MIN_PER_SYMBOL_USDT', 0.0))
+            max_cap = max(0.0, _to_float('MAX_PER_SYMBOL_USDT', 0.0))
+
+            if min_floor > 0 and allocated_amount < min_floor:
+                allocated_amount = min_floor
+            if max_cap > 0 and allocated_amount > max_cap:
+                allocated_amount = max_cap
+
+            logger.info(f"💵 资金分配: 模式={alloc_mode}, 总余额={balance:.4f}U, 分母={base_divisor}, 因子={factor:.2f}, 本币目标={allocated_amount:.4f}U")
+            if allocated_amount <= 0:
+                logger.warning(f"⚠️ {symbol}最终分配金额为0，跳过")
+                return 0.0
+
             return allocated_amount
 
         except Exception as e:
