@@ -575,8 +575,10 @@ class MACDStrategy:
             
             logger.info(f"📝 准备下单: {symbol} {side} 金额:{amount:.4f}U 价格:{current_price:.4f} 数量:{contract_size:.8f}")
             
-            # 创建市价单
-            order = self.exchange.create_market_order(symbol, side, contract_size)
+            # 创建市价单（OKX 对冲模式需要传 posSide）
+            pos_side = 'long' if side == 'buy' else 'short'
+            params = {'posSide': pos_side, 'tdMode': 'cross'}
+            order = self.exchange.create_market_order(symbol, side, contract_size, params)
             
             if order['id']:
                 logger.info(f"✅ 成功创建{symbol} {side}订单，金额:{amount:.4f}U，数量:{contract_size:.8f}")
@@ -620,8 +622,8 @@ class MACDStrategy:
             
             logger.info(f"📝 准备平仓: {symbol} {side} 数量:{size:.6f} 预计盈亏:{pnl:.2f}U")
             
-            # 使用reduceOnly参数以确保只是平仓
-            order = self.exchange.create_market_order(symbol, side, size, {'reduceOnly': True})
+            # 使用reduceOnly参数以确保只是平仓；OKX 需指定当前持仓方向的 posSide
+            order = self.exchange.create_market_order(symbol, side, size, {'reduceOnly': True, 'posSide': position_side, 'tdMode': 'cross'})
             
             if order['id']:
                 logger.info(f"✅ 成功平仓{symbol}，方向: {side}，数量: {size:.6f}，盈亏: {pnl:.2f}U")
