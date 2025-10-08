@@ -926,7 +926,7 @@ class MACDStrategy:
         logger.info(f"📊 K线周期: {self.timeframe} (15分钟)")
         lev_desc = ', '.join([f"{s.split('/')[0]}={self.symbol_leverage.get(s, 20)}x" for s in self.symbols])
         logger.info(f"💪 杠杆倍数: {lev_desc}")
-        logger.info("⏰ 刷新方式: 北京时间整点刷新（每小时00:00触发一次）")
+        logger.info("⏰ 刷新方式: 北京时间15分钟准点刷新（00/15/30/45），提前1分钟预热")
         logger.info(f"🔄 状态同步: 每{self.sync_interval}秒")
         logger.info(f"📊 监控币种: {', '.join(self.symbols)}")
         logger.info(f"💡 小币种特性: 支持0.1U起的小额交易")
@@ -937,17 +937,39 @@ class MACDStrategy:
 
         while True:
             try:
-                # 计算下一个整点（北京时间）
+                # 计算下一个15分钟准点（北京时间），并在准点前60秒开始预热
                 now = datetime.datetime.now(china_tz)
-                next_top = (now.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1))
-                wait_sec = max(0.0, (next_top - now).total_seconds())
-                logger.info(f"⏳ 等待至下一个整点: {next_top.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)，约{int(wait_sec)}秒...")
-                time.sleep(wait_sec)
+                # 下一个 00/15/30/45 的边界
+                next_quarter = (now.replace(second=0, microsecond=0)
+                                .replace(minute=(now.minute // 15) * 15) + datetime.timedelta(minutes=15))
+                prewarm_start = next_quarter - datetime.timedelta(seconds=60)
 
-                # 到整点后执行一次策略
+                if now < prewarm_start:
+                    wait_sec = int((prewarm_start - now).total_seconds())
+                    logger.info(f"⏳ 等待至预热开始: {prewarm_start.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)，约{wait_sec}秒...")
+                    time.sleep(wait_sec)
+
+                # 预热阶段：同步状态并拉取行情，确保准点不丢信号
+                logger.info(f"🔥 预热开始（提前60秒）：目标准点 {next_quarter.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
+                try:
+                    self.check_sync_needed()
+                    # 轻量行情预拉，暖链路/缓存
+                    for sym in self.symbols:
+                        _ = self.get_klines(sym, 100)
+                    logger.info("✅ 预热完成，等待准点触发...")
+                except Exception as e:
+                    logger.warning(f"⚠️ 预热过程出现问题: {e}，继续等待准点")
+
+                # 等待到准点秒级触发
+                now = datetime.datetime.now(china_tz)
+                if now < next_quarter:
+                    wait_to_quarter = max(0.0, (next_quarter - now).total_seconds())
+                    time.sleep(wait_to_quarter)
+
+                # 准点执行策略
                 self.execute_strategy()
 
-                # 若执行很快，可能仍处于同一秒，为避免重复触发，轻微等待1秒
+                # 避免同秒重复触发
                 time.sleep(1)
 
             except KeyboardInterrupt:
