@@ -591,18 +591,34 @@ class MACDStrategy:
             return False
     
     def calculate_order_amount(self, symbol: str) -> float:
-        """计算下单金额（使用总余额平均分配到各交易对，使用 position_percentage 比例）"""
+        """计算下单金额（总余额平均分配，并使用最小USDT下限保证足够覆盖手续费）"""
         try:
             balance = self.get_account_balance()
             total_amount = balance * self.position_percentage
             num_symbols = max(1, len(self.symbols))
             allocated_amount = total_amount / num_symbols
 
+            # 读取每币最小USDT下限（默认3U，可通过 PER_SYMBOL_MIN_USDT 调整）
+            try:
+                min_usdt_env = os.environ.get('PER_SYMBOL_MIN_USDT', '').strip()
+                min_usdt = float(min_usdt_env) if min_usdt_env else 3.0
+                if min_usdt <= 0:
+                    min_usdt = 3.0
+            except Exception:
+                min_usdt = 3.0
+
             if allocated_amount <= 0:
                 logger.warning(f"⚠️ 可用余额不足，无法为 {symbol} 分配下单金额 (余额:{balance:.4f}U, 使用比例:{self.position_percentage:.2f})")
                 return 0.0
 
-            logger.info(f"💵 资金分配: 总余额={balance:.4f}U, 使用比例={self.position_percentage:.2f}, 每币分配={allocated_amount:.4f}U")
+            # 如果平均分配低于下限且总余额足以支撑所有币按下限分配，则提升到下限
+            if allocated_amount < min_usdt and balance >= min_usdt * num_symbols:
+                logger.info(f"🔧 提升下单金额至下限: {symbol} 从 {allocated_amount:.4f}U 提升到 {min_usdt:.4f}U 以覆盖手续费/最小成本")
+                allocated_amount = min_usdt
+            elif allocated_amount < min_usdt:
+                logger.warning(f"⚠️ 总余额不足以按每币下限 {min_usdt:.2f}U 分配，{symbol}维持平均值 {allocated_amount:.4f}U (余额:{balance:.4f}U)")
+
+            logger.info(f"💵 资金分配: 总余额={balance:.4f}U, 使用比例={self.position_percentage:.2f}, 每币分配={allocated_amount:.4f}U (下限={min_usdt:.2f}U)")
             return allocated_amount
 
         except Exception as e:
@@ -656,27 +672,45 @@ class MACDStrategy:
             if contract_size < min_amount:
                 contract_size = min_amount
 
-            # 先按步进截断，再按小数位四舍五入
+            # 先按步进向上对齐，再按小数位四舍五入（尽量用满分配金额）
+            step = None
             if lot_sz:
                 try:
                     step = float(lot_sz)
-                    if step > 0:
-                        contract_size = math.floor(contract_size / step) * step
+                    if step and step > 0:
+                        contract_size = math.ceil(contract_size / step) * step
                 except Exception:
-                    pass
+                    step = None
             contract_size = round(contract_size, amount_precision)
 
             # 防止截断后为0或仍小于最小数量
             if contract_size <= 0 or contract_size < min_amount:
                 contract_size = max(min_amount, 10 ** (-amount_precision))
-                if lot_sz:
+                if step and step > 0:
                     try:
-                        step = float(lot_sz)
-                        if step > 0:
-                            contract_size = math.ceil(contract_size / step) * step
+                        contract_size = math.ceil(contract_size / step) * step
                     except Exception:
                         pass
                 contract_size = round(contract_size, amount_precision)
+
+            # 若按当前价格计算的成本仍低于分配金额，则按步进/精度向上补量，尽量使 size*price ≥ amount
+            try:
+                used_usdt = contract_size * current_price
+                if used_usdt + 1e-12 < amount:
+                    # 计算还需增加的数量
+                    need_qty = (amount - used_usdt) / current_price
+                    incr_step = step if (step and step > 0) else (10 ** (-amount_precision))
+                    # 向上取整到合法步进
+                    add_qty = math.ceil(need_qty / incr_step) * incr_step
+                    contract_size = round(contract_size + add_qty, amount_precision)
+                    # 再次确保不低于最小数量
+                    if contract_size < min_amount:
+                        contract_size = min_amount
+                        if step and step > 0:
+                            contract_size = math.ceil(contract_size / step) * step
+                        contract_size = round(contract_size, amount_precision)
+            except Exception:
+                pass
 
             if contract_size <= 0:
                 logger.warning(f"⚠️ {symbol}最终数量无效: {contract_size}")
