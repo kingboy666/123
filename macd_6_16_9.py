@@ -193,11 +193,11 @@ class MACDStrategy:
             # 同步交易所时间
             self.sync_exchange_time()
             
-            # 按交易对设置杠杆
+            # 按交易对设置杠杆（OKX参数为 mgnMode 而非 marginMode）
             for symbol in self.symbols:
                 try:
                     lev = self.symbol_leverage.get(symbol, 20)
-                    self.exchange.set_leverage(lev, symbol, {'marginMode': 'cross'})
+                    self.exchange.set_leverage(lev, symbol, {'mgnMode': 'cross'})
                     logger.info(f"✅ 设置{symbol}杠杆为{lev}倍")
                 except Exception as e:
                     logger.warning(f"⚠️ 设置{symbol}杠杆失败（可能已设置）: {e}")
