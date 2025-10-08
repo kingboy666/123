@@ -201,6 +201,11 @@ class MACDStrategy:
         try:
             # 检查连接
             self.exchange.check_required_credentials()
+            # 强制设定 OKX API 版本，避免 ccxt 内部 URL 拼接出现 None + str
+            try:
+                self.exchange.version = 'v5'
+            except Exception:
+                pass
             logger.info("✅ API连接验证成功")
             
             # 同步交易所时间
