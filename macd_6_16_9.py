@@ -130,6 +130,9 @@ class MACDStrategy:
             }
         })
         
+        # OKX统一参数（强制使用SWAP场景）
+        self.okx_params = {'instType': 'SWAP'}
+        
         # 交易对配置 - 小币种
         self.symbols = [
             'FIL/USDT:USDT',
@@ -291,7 +294,7 @@ class MACDStrategy:
     def get_open_orders(self, symbol: str) -> List[Dict]:
         """获取未成交订单"""
         try:
-            orders = self.exchange.fetch_open_orders(symbol)
+            orders = self.exchange.fetch_open_orders(symbol, self.okx_params)
             return orders
         except Exception as e:
             logger.error(f"❌ 获取{symbol}挂单失败: {e}")
@@ -449,7 +452,7 @@ class MACDStrategy:
     def get_account_balance(self) -> float:
         """获取账户余额"""
         try:
-            balance = self.exchange.fetch_balance()
+            balance = self.exchange.fetch_balance({'type': 'swap'})
             free_balance = float(balance['USDT']['free'])
             total_balance = float(balance['USDT']['total'])
             used_balance = float(balance['USDT']['used'])
@@ -480,7 +483,7 @@ class MACDStrategy:
                 return self.positions_cache[symbol]
             
             # 从交易所获取最新持仓
-            positions = self.exchange.fetch_positions([symbol])
+            positions = self.exchange.fetch_positions([symbol], self.okx_params)
             for position in positions:
                 if position['symbol'] == symbol:
                     pos_data = {
