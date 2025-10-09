@@ -193,6 +193,18 @@ class MACDStrategy:
             self.atr_tp_m = 3.0
         # SL/TP 状态缓存：symbol -> {'sl': float, 'tp': float, 'side': 1/-1, 'entry': float}
         self.sl_tp_state: Dict[str, Dict[str, float]] = {}
+        # 交易所侧TP/SL已挂标记：symbol -> bool
+        self.okx_tp_sl_placed: Dict[str, bool] = {}
+        # 每币种参数配置（硬编码）
+        self.symbol_cfg: Dict[str, Dict[str, float | str]] = {
+            "ZRO/USDT:USDT": {"period": 14, "n": 1.8, "m": 2.6, "trigger_pct": 0.008, "trail_pct": 0.005, "update_basis": "high"},
+            "WIF/USDT:USDT": {"period": 20, "n": 2.5, "m": 3.0, "trigger_pct": 0.012, "trail_pct": 0.008, "update_basis": "high"},
+            "WLD/USDT:USDT": {"period": 20, "n": 2.0, "m": 3.0, "trigger_pct": 0.010, "trail_pct": 0.006, "update_basis": "close"},
+            "FIL/USDT:USDT": {"period": 20, "n": 2.2, "m": 3.5, "trigger_pct": 0.010, "trail_pct": 0.006, "update_basis": "high"},
+        }
+        # 跟踪峰值/谷值（用于动态止损）
+        self.trailing_peak: Dict[str, float] = {}   # long使用：记录最高价
+        self.trailing_trough: Dict[str, float] = {} # short使用：记录最低价
         
         # 记录上次持仓状态，用于判断是否已平仓
         self.last_position_state: Dict[str, str] = {}  # symbol -> 'long'/'short'/'none'
@@ -1036,38 +1048,79 @@ class MACDStrategy:
     
     # === 新增：ATR 与 ADX 计算（Wilder算法） ===
 
+    def get_symbol_cfg(self, symbol: str) -> Dict[str, float | str]:
+        """返回币种配置；若未配置则使用默认"""
+        try:
+            cfg = self.symbol_cfg.get(symbol)
+            if cfg:
+                return cfg
+        except Exception:
+            pass
+        return {"period": 20, "n": 2.0, "m": 3.0, "trigger_pct": 0.010, "trail_pct": 0.006, "update_basis": "close"}
+
     def _set_initial_sl_tp(self, symbol: str, entry_price: float, atr_val: float, side: str):
-        """设置初始 SL/TP：多头 SL=P-N*ATR，TP=P+M*ATR；空头 SL=P+N*ATR，TP=P-M*ATR"""
+        """设置初始 SL/TP：多头 SL=P-N*ATR，TP=P+M*ATR；空头 SL=P+N*ATR，TP=P-M*ATR（使用币种配置n/m）"""
         try:
             if atr_val <= 0 or entry_price <= 0 or side not in ('long', 'short'):
                 return
-            n = float(self.atr_sl_n)
-            m = float(self.atr_tp_m)
+            cfg = self.get_symbol_cfg(symbol)
+            n = float(cfg['n']); m = float(cfg['m'])
             if side == 'long':
                 sl = entry_price - n * atr_val
                 tp = entry_price + m * atr_val
                 side_num = 1.0
+                # 初始化峰值
+                self.trailing_peak[symbol] = max(entry_price, self.trailing_peak.get(symbol, entry_price))
             else:
                 sl = entry_price + n * atr_val
                 tp = entry_price - m * atr_val
                 side_num = -1.0
+                # 初始化谷值
+                self.trailing_trough[symbol] = min(entry_price, self.trailing_trough.get(symbol, entry_price)) if symbol in self.trailing_trough else entry_price
             self.sl_tp_state[symbol] = {'sl': float(sl), 'tp': float(tp), 'side': side_num, 'entry': float(entry_price)}
         except Exception:
             pass
 
     def _update_trailing_stop(self, symbol: str, current_price: float, atr_val: float, side: str):
-        """动态移动止损：long: SL=max(SL_old, 价-N*ATR)；short: SL=min(SL_old, 价+N*ATR)"""
+        """动态移动止损（币种配置）：
+        - update_basis: 'high' 用最高价更新峰值（long）/最低价更新谷值（short）；'close' 用收盘价/当前价
+        - 激活条件：价格相对入场达到 trigger_pct
+        - long: SL=max(SL_old, basis-N*ATR, peak*(1-trail_pct)); short: SL=min(SL_old, basis+N*ATR, trough*(1+trail_pct))
+        """
         try:
             st = self.sl_tp_state.get(symbol)
             if not st or atr_val <= 0 or current_price <= 0 or side not in ('long', 'short'):
                 return
-            n = float(self.atr_sl_n)
+            cfg = self.get_symbol_cfg(symbol)
+            n = float(cfg['n']); trigger_pct = float(cfg['trigger_pct']); trail_pct = float(cfg['trail_pct'])
+            entry = float(st.get('entry', 0) or 0)
+            if entry <= 0:
+                return
+
+            # 选择更新基准价
+            basis_price = float(current_price)
+            # 若有当前K线最高/最低价，可在调用处传入；此处回退使用 current_price
             if side == 'long':
-                new_sl = current_price - n * atr_val
+                # 更新峰值
+                peak = max(self.trailing_peak.get(symbol, entry), basis_price)
+                self.trailing_peak[symbol] = peak
+                # 激活条件：涨幅达到 trigger_pct
+                activated = (basis_price >= entry * (1 + trigger_pct))
+                atr_sl = basis_price - n * atr_val
+                percent_sl = peak * (1 - trail_pct) if activated else st['sl']
+                new_sl = max(st['sl'], atr_sl, percent_sl)
                 if new_sl > st['sl']:
                     st['sl'] = float(new_sl)
             else:
-                new_sl = current_price + n * atr_val
+                # 更新谷值
+                trough_prev = self.trailing_trough.get(symbol, entry)
+                trough = min(trough_prev, basis_price) if trough_prev else basis_price
+                self.trailing_trough[symbol] = trough
+                # 激活条件：跌幅达到 trigger_pct（相对入场价下跌）
+                activated = (basis_price <= entry * (1 - trigger_pct))
+                atr_sl = basis_price + n * atr_val
+                percent_sl = trough * (1 + trail_pct) if activated else st['sl']
+                new_sl = min(st['sl'], atr_sl, percent_sl)
                 if new_sl < st['sl']:
                     st['sl'] = float(new_sl)
             self.sl_tp_state[symbol] = st
@@ -1106,6 +1159,9 @@ class MACDStrategy:
     def place_okx_tp_sl(self, symbol: str, entry_price: float, side: str, atr_val: float) -> bool:
         """在OKX侧同时挂TP/SL条件单；posSide=long→side='sell'，posSide=short→side='buy'；执行价用市价(-1)"""
         try:
+            # 已挂过则直接返回
+            if self.okx_tp_sl_placed.get(symbol):
+                return True
             inst_id = self.symbol_to_inst_id(symbol)
             if not inst_id or entry_price <= 0 or atr_val <= 0 or side not in ('long', 'short'):
                 return False
@@ -1150,6 +1206,7 @@ class MACDStrategy:
                 ok = bool(resp)
             if ok:
                 logger.info(f"📌 交易所侧TP/SL已挂 {symbol}: size={size:.6f} TP@{tp_trigger:.6f} SL@{sl_trigger:.6f}")
+                self.okx_tp_sl_placed[symbol] = True
                 return True
             else:
                 logger.warning(f"⚠️ 交易所侧TP/SL挂单失败 {symbol}: {resp}")
