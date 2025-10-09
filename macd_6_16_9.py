@@ -385,6 +385,111 @@ class MACDStrategy:
             logger.error(f"❌ 批量取消订单失败: {e}")
             return False
     
+    # === 新增：条件单读取/取消与持仓保护 ===
+    def get_open_algo_orders(self, symbol: str) -> List[Dict]:
+        """获取未触发的条件单（TP/SL），包含 oco 与 conditional"""
+        try:
+            inst_id = self.symbol_to_inst_id(symbol)
+            results: List[Dict] = []
+            # conditional
+            try:
+                resp_cond = self.exchange.privateGetTradeOrdersAlgoPending({'instType': 'SWAP', 'instId': inst_id, 'ordType': 'conditional'})
+                data_cond = resp_cond.get('data') if isinstance(resp_cond, dict) else resp_cond
+            except Exception:
+                data_cond = []
+            # oco
+            try:
+                resp_oco = self.exchange.privateGetTradeOrdersAlgoPending({'instType': 'SWAP', 'instId': inst_id, 'ordType': 'oco'})
+                data_oco = resp_oco.get('data') if isinstance(resp_oco, dict) else resp_oco
+            except Exception:
+                data_oco = []
+            for o in ((data_cond or []) + (data_oco or [])):
+                results.append({
+                    'id': o.get('algoId') or o.get('ordId') or o.get('clOrdId'),
+                    'posSide': (o.get('posSide') or '').lower(),
+                    'tpTriggerPx': float(o.get('tpTriggerPx')) if o.get('tpTriggerPx') else None,
+                    'slTriggerPx': float(o.get('slTriggerPx')) if o.get('slTriggerPx') else None,
+                    'sz': float(o.get('sz') or 0),
+                })
+            return results
+        except Exception as e:
+            logger.error(f"❌ 获取{symbol}条件单失败: {e}")
+            return []
+
+    def cancel_algo_orders(self, symbol: str, pos_side: str) -> bool:
+        """取消某个 posSide 下的所有条件单（TP/SL）"""
+        try:
+            inst_id = self.symbol_to_inst_id(symbol)
+            algo_orders = self.get_open_algo_orders(symbol)
+            to_cancel = []
+            for o in algo_orders:
+                if (o.get('posSide') or '').lower() == (pos_side or '').lower():
+                    algo_id = o.get('id')
+                    if algo_id:
+                        to_cancel.append({'algoId': str(algo_id), 'instId': inst_id})
+            if not to_cancel:
+                return True
+            resp = self.exchange.privatePostTradeCancelAlgos(to_cancel)
+            ok = isinstance(resp, dict) or isinstance(resp, list)
+            if ok:
+                logger.info(f"✅ 取消{symbol}({pos_side})条件单: {len(to_cancel)} 条")
+            else:
+                logger.warning(f"⚠️ 取消{symbol}({pos_side})条件单返回异常: {resp}")
+            return ok
+        except Exception as e:
+            logger.error(f"❌ 取消{symbol}({pos_side})条件单失败: {e}")
+            return False
+
+    def ensure_position_protection(self, symbol: str) -> None:
+        """若存在持仓但未配置或仅单侧TP/SL，则自动补挂OCO；使用1.py现有ATR与参数。"""
+        try:
+            position = self.get_position(symbol, force_refresh=True)
+            if position.get('size', 0) <= 0:
+                return
+            pos_side = (position.get('side') or '').lower()  # 'long'/'short'
+
+            # 去抖：60秒内不重复
+            if not hasattr(self, '_algo_guard'):
+                self._algo_guard = {}
+            key = (symbol, pos_side)
+            now = time.time()
+            if (self._algo_guard.get(key) or 0) + 60 > now:
+                return
+
+            algo_orders = self.get_open_algo_orders(symbol)
+            has_tp, has_sl = False, False
+            for o in algo_orders:
+                o_pos = (o.get('posSide') or '').lower()
+                if o_pos in ('', pos_side):
+                    has_tp = has_tp or (o.get('tpTriggerPx') not in (None, 0, '0'))
+                    has_sl = has_sl or (o.get('slTriggerPx') not in (None, 0, '0'))
+
+            if has_tp and has_sl:
+                logger.info(f"🧷 {symbol} 持仓已存在TP/SL条件单（posSide={pos_side}）")
+                return
+
+            # 计算 ATR
+            kl = self.get_klines(symbol, 50)
+            try:
+                atr_p = int((os.environ.get('ATR_PERIOD') or '14').strip())
+            except Exception:
+                atr_p = 14
+            atr_val = self.calculate_atr(kl, atr_p) if kl else 0.0
+            entry = float(position.get('entry_price', 0) or 0)
+            if atr_val <= 0 or entry <= 0:
+                logger.warning(f"⚠️ 无法计算ATR或入场价无效，跳过补挂 {symbol}")
+                return
+
+            # 单侧存在则先取消该侧，再重建OCO
+            if has_tp ^ has_sl:
+                self.cancel_algo_orders(symbol, pos_side)
+
+            ok = self.place_okx_tp_sl(symbol, entry, pos_side, atr_val)
+            if ok:
+                self._algo_guard[key] = now
+        except Exception as e:
+            logger.error(f"❌ 确保{symbol}持仓保护失败: {e}")
+
     def sync_all_status(self):
         """同步所有状态（持仓和挂单）"""
         try:
@@ -405,23 +510,12 @@ class MACDStrategy:
                 # 记录持仓状态
                 if position['size'] > 0:
                     self.last_position_state[symbol] = position['side']
+                    has_positions = True
                 # 启动时为已有持仓补挂交易所侧TP/SL
                 try:
-                    kl = self.get_klines(symbol, 50)
-                    atr_p = int((os.environ.get('ATR_PERIOD') or '14').strip())
-                    atr_val = self.calculate_atr(kl, atr_p) if kl else 0.0
-                    entry = float(position.get('entry_price', 0) or 0)
-                    if atr_val > 0 and entry > 0:
-                        okx_ok = self.place_okx_tp_sl(symbol, entry, position.get('side', 'long'), atr_val)
-                        if okx_ok:
-                            logger.info(f"📌 已为已有持仓补挂TP/SL {symbol}")
-                        else:
-                            logger.warning(f"⚠️ 补挂交易所侧TP/SL失败 {symbol}")
+                    self.ensure_position_protection(symbol)
                 except Exception as _e:
                     logger.warning(f"⚠️ 补挂交易所侧TP/SL异常 {symbol}: {_e}")
-                    has_positions = True
-                else:
-                    self.last_position_state[symbol] = 'none'
                 
                 # 同步挂单
                 orders = self.get_open_orders(symbol)
@@ -879,22 +973,8 @@ class MACDStrategy:
 
             if order_id:
                 time.sleep(2)
-                pos = self.get_position(symbol, force_refresh=True)
-                # 设置初始 SL/TP（基于最新 ATR）
                 try:
-                    kl = self.get_klines(symbol, 50)
-                    atr_p = int((os.environ.get('ATR_PERIOD') or '14').strip())
-                    atr_val = self.calculate_atr(kl, atr_p) if kl else 0.0
-                    if pos and pos.get('size', 0) > 0 and atr_val > 0:
-                        self._set_initial_sl_tp(symbol, float(pos.get('entry_price', 0) or 0), atr_val, pos.get('side', 'long'))
-                        st = self.sl_tp_state.get(symbol)
-                        if st:
-                            logger.info(f"🎯 初始化SL/TP {symbol}: SL={st['sl']:.6f}, TP={st['tp']:.6f} (N={self.atr_sl_n}, M={self.atr_tp_m}, ATR={atr_val:.6f})")
-                            okx_ok = self.place_okx_tp_sl(symbol, float(pos.get('entry_price', 0) or 0), pos.get('side', 'long'), atr_val)
-                            if okx_ok:
-                                logger.info(f"📌 已在交易所侧挂TP/SL {symbol}")
-                            else:
-                                logger.warning(f"⚠️ 交易所侧TP/SL挂单失败 {symbol}")
+                    self.ensure_position_protection(symbol)
                 except Exception:
                     pass
                 return True
