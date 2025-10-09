@@ -182,6 +182,18 @@ class MACDStrategy:
         # 交易统计
         self.stats = TradingStats()
         
+        # ATR 止盈止损参数（环境变量可覆盖）：N=止损倍数，M=止盈倍数
+        try:
+            self.atr_sl_n = float((os.environ.get('ATR_SL_N') or '2.0').strip())
+        except Exception:
+            self.atr_sl_n = 2.0
+        try:
+            self.atr_tp_m = float((os.environ.get('ATR_TP_M') or '3.0').strip())
+        except Exception:
+            self.atr_tp_m = 3.0
+        # SL/TP 状态缓存：symbol -> {'sl': float, 'tp': float, 'side': 1/-1, 'entry': float}
+        self.sl_tp_state: Dict[str, Dict[str, float]] = {}
+        
         # 记录上次持仓状态，用于判断是否已平仓
         self.last_position_state: Dict[str, str] = {}  # symbol -> 'long'/'short'/'none'
         
@@ -381,6 +393,17 @@ class MACDStrategy:
                 # 记录持仓状态
                 if position['size'] > 0:
                     self.last_position_state[symbol] = position['side']
+                # 启动时为已有持仓补挂交易所侧TP/SL
+                try:
+                    kl = self.get_klines(symbol, 50)
+                    atr_p = int((os.environ.get('ATR_PERIOD') or '14').strip())
+                    atr_val = self.calculate_atr(kl, atr_p) if kl else 0.0
+                    entry = float(position.get('entry_price', 0) or 0)
+                    if atr_val > 0 and entry > 0:
+                        self.place_okx_tp_sl(symbol, entry, position.get('side', 'long'), atr_val)
+                        logger.info(f"📌 已为已有持仓补挂TP/SL {symbol}")
+                except Exception as _e:
+                    logger.warning(f"⚠️ 补挂交易所侧TP/SL失败 {symbol}: {_e}")
                     has_positions = True
                 else:
                     self.last_position_state[symbol] = 'none'
@@ -514,7 +537,7 @@ class MACDStrategy:
             return 0.0
     
     def get_klines(self, symbol: str, limit: int = 100) -> List[Dict]:
-        """获取K线数据 - 15分钟周期（OKX v5 原生接口）"""
+        """获取K线数据 - 5分钟周期（OKX v5 原生接口）"""
         try:
             inst_id = self.symbol_to_inst_id(symbol)
             # OKX v5: /api/v5/market/candles?instId=...&bar=15m&limit=...
@@ -841,7 +864,24 @@ class MACDStrategy:
 
             if order_id:
                 time.sleep(2)
-                self.get_position(symbol, force_refresh=True)
+                pos = self.get_position(symbol, force_refresh=True)
+                # 设置初始 SL/TP（基于最新 ATR）
+                try:
+                    kl = self.get_klines(symbol, 50)
+                    atr_p = int((os.environ.get('ATR_PERIOD') or '14').strip())
+                    atr_val = self.calculate_atr(kl, atr_p) if kl else 0.0
+                    if pos and pos.get('size', 0) > 0 and atr_val > 0:
+                        self._set_initial_sl_tp(symbol, float(pos.get('entry_price', 0) or 0), atr_val, pos.get('side', 'long'))
+                        st = self.sl_tp_state.get(symbol)
+                        if st:
+                            logger.info(f"🎯 初始化SL/TP {symbol}: SL={st['sl']:.6f}, TP={st['tp']:.6f} (N={self.atr_sl_n}, M={self.atr_tp_m}, ATR={atr_val:.6f})")
+                            try:
+                                self.place_okx_tp_sl(symbol, float(pos.get('entry_price', 0) or 0), pos.get('side', 'long'), atr_val)
+                                logger.info(f"📌 已在交易所侧挂TP/SL {symbol}")
+                            except Exception as _e:
+                                logger.warning(f"⚠️ 挂交易所侧TP/SL失败 {symbol}: {_e}")
+                except Exception:
+                    pass
                 return True
 
             # 若三次都失败，抛出最后错误提示
@@ -991,6 +1031,140 @@ class MACDStrategy:
             'signal_line': signal_line
         }
     
+    # === 新增：ATR 与 ADX 计算（Wilder算法） ===
+
+    def _set_initial_sl_tp(self, symbol: str, entry_price: float, atr_val: float, side: str):
+        """设置初始 SL/TP：多头 SL=P-N*ATR，TP=P+M*ATR；空头 SL=P+N*ATR，TP=P-M*ATR"""
+        try:
+            if atr_val <= 0 or entry_price <= 0 or side not in ('long', 'short'):
+                return
+            n = float(self.atr_sl_n)
+            m = float(self.atr_tp_m)
+            if side == 'long':
+                sl = entry_price - n * atr_val
+                tp = entry_price + m * atr_val
+                side_num = 1.0
+            else:
+                sl = entry_price + n * atr_val
+                tp = entry_price - m * atr_val
+                side_num = -1.0
+            self.sl_tp_state[symbol] = {'sl': float(sl), 'tp': float(tp), 'side': side_num, 'entry': float(entry_price)}
+        except Exception:
+            pass
+
+    def _update_trailing_stop(self, symbol: str, current_price: float, atr_val: float, side: str):
+        """动态移动止损：long: SL=max(SL_old, 价-N*ATR)；short: SL=min(SL_old, 价+N*ATR)"""
+        try:
+            st = self.sl_tp_state.get(symbol)
+            if not st or atr_val <= 0 or current_price <= 0 or side not in ('long', 'short'):
+                return
+            n = float(self.atr_sl_n)
+            if side == 'long':
+                new_sl = current_price - n * atr_val
+                if new_sl > st['sl']:
+                    st['sl'] = float(new_sl)
+            else:
+                new_sl = current_price + n * atr_val
+                if new_sl < st['sl']:
+                    st['sl'] = float(new_sl)
+            self.sl_tp_state[symbol] = st
+        except Exception:
+            pass
+    def place_okx_tp_sl(self, symbol: str, entry_price: float, side: str, atr_val: float):
+        """在OKX侧同时挂TP/SL条件单，执行价为市价(-1)，触发价基于ATR"""
+        try:
+            inst_id = self.symbol_to_inst_id(symbol)
+            n = float(self.atr_sl_n); m = float(self.atr_tp_m)
+            if side == 'long':
+                sl_trigger = entry_price - n * atr_val
+                tp_trigger = entry_price + m * atr_val
+                pos_side = 'long'
+            else:
+                sl_trigger = entry_price + n * atr_val
+                tp_trigger = entry_price - m * atr_val
+                pos_side = 'short'
+            params = {
+                'instId': inst_id,
+                'tdMode': 'cross',
+                'posSide': pos_side,
+                'ordType': 'oco',  # 同时挂TP/SL
+                'tpTriggerPx': f"{tp_trigger}",
+                'tpOrdPx': '-1',   # 市价
+                'slTriggerPx': f"{sl_trigger}",
+                'slOrdPx': '-1',   # 市价
+            }
+            resp = self.exchange.privatePostTradeOrderAlgo(params)
+            logger.info(f"📌 交易所侧TP/SL已挂 {symbol}: TP@{tp_trigger:.6f} SL@{sl_trigger:.6f}")
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ 交易所侧TP/SL挂单失败 {symbol}: {e}")
+            return False
+
+    def calculate_atr(self, klines: List[Dict], period: int = 14) -> float:
+        """计算 ATR（Wilder），返回最新值；klines需含 high/low/close，按时间升序"""
+        try:
+            if len(klines) < period + 1:
+                return 0.0
+            highs = np.array([k['high'] for k in klines], dtype=float)
+            lows = np.array([k['low'] for k in klines], dtype=float)
+            closes = np.array([k['close'] for k in klines], dtype=float)
+            prev_closes = np.concatenate(([closes[0]], closes[:-1]))
+            tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_closes), np.abs(lows - prev_closes)))
+            # Wilder 平滑：先用TR的period均值作为首个ATR，再进行递推
+            atr = np.zeros_like(tr)
+            atr[period-1] = tr[:period].mean()
+            for i in range(period, len(tr)):
+                atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
+            return float(atr[-1])
+        except Exception:
+            return 0.0
+
+    def calculate_adx(self, klines: List[Dict], period: int = 14) -> float:
+        """计算 ADX（Wilder），返回最新值；klines需含 high/low/close，按时间升序"""
+        try:
+            if len(klines) < period + 1:
+                return 0.0
+            highs = np.array([k['high'] for k in klines], dtype=float)
+            lows = np.array([k['low'] for k in klines], dtype=float)
+            closes = np.array([k['close'] for k in klines], dtype=float)
+
+            up_move = highs[1:] - highs[:-1]
+            down_move = lows[:-1] - lows[1:]
+            plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+            minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+            prev_closes = closes[:-1]
+            tr = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - prev_closes), np.abs(lows[1:] - prev_closes)))
+
+            # Wilder 平滑
+            def wilder_smooth(arr):
+                sm = np.zeros_like(arr)
+                sm[period-1] = arr[:period].sum()
+                for i in range(period, len(arr)):
+                    sm[i] = sm[i-1] - (sm[i-1] / period) + arr[i]
+                return sm
+
+            plus_dm_sm = wilder_smooth(plus_dm)
+            minus_dm_sm = wilder_smooth(minus_dm)
+            tr_sm = wilder_smooth(tr)
+
+            # 避免除零
+            tr_sm_safe = np.where(tr_sm == 0, 1e-12, tr_sm)
+
+            plus_di = 100.0 * (plus_dm_sm / tr_sm_safe)
+            minus_di = 100.0 * (minus_dm_sm / tr_sm_safe)
+            dx = 100.0 * (np.abs(plus_di - minus_di) / np.maximum(plus_di + minus_di, 1e-12))
+
+            # ADX 为 DX 的 Wilder 平滑
+            adx = np.zeros_like(dx)
+            adx[period-1] = dx[:period].mean()
+            for i in range(period, len(dx)):
+                adx[i] = (adx[i-1] * (period - 1) + dx[i]) / period
+
+            return float(adx[-1])
+        except Exception:
+            return 0.0
+
     def analyze_symbol(self, symbol: str) -> Dict[str, str]:
         """分析单个交易对"""
         try:
@@ -1005,12 +1179,129 @@ class MACDStrategy:
             if len(closes) < 2:
                 return {'signal': 'hold', 'reason': '数据不足'}
 
+            # === 先做ATR与ADX过滤 ===
+            try:
+                atr_period = int((os.environ.get('ATR_PERIOD') or '14').strip())
+            except Exception:
+                atr_period = 14
+            try:
+                atr_ratio_thresh = float((os.environ.get('ATR_RATIO_THRESH') or '0.004').strip())
+            except Exception:
+                atr_ratio_thresh = 0.004
+            try:
+                adx_period = int((os.environ.get('ADX_PERIOD') or '14').strip())
+            except Exception:
+                adx_period = 14
+            try:
+                adx_min_trend = float((os.environ.get('ADX_MIN_TREND') or '25').strip())
+            except Exception:
+                adx_min_trend = 25.0
+
+            close_price = float(closes[-1])
+            atr_val = self.calculate_atr(klines, atr_period)
+            adx_val = self.calculate_adx(klines, adx_period)
+
+            if atr_val > 0 and close_price > 0:
+                atr_ratio = atr_val / close_price
+                if atr_ratio < atr_ratio_thresh:
+                    logger.debug(f"ATR滤波提示：波动率低（ATR/收盘={atr_ratio:.4f} < {atr_ratio_thresh}），不拦截信号")
+
+            if adx_val > 0 and adx_val < adx_min_trend:
+                logger.debug(f"ADX滤波提示：趋势不足（ADX={adx_val:.1f} < {adx_min_trend}），不拦截信号")
+
+            # === ATR/ADX 过滤 ===
+            try:
+                atr_period = int((os.environ.get('ATR_PERIOD') or '14').strip())
+            except Exception:
+                atr_period = 14
+            try:
+                atr_ratio_thresh = float((os.environ.get('ATR_RATIO_THRESH') or '0.004').strip())
+            except Exception:
+                atr_ratio_thresh = 0.004
+            try:
+                adx_period = int((os.environ.get('ADX_PERIOD') or '14').strip())
+            except Exception:
+                adx_period = 14
+            try:
+                adx_min_trend = float((os.environ.get('ADX_MIN_TREND') or '25').strip())
+            except Exception:
+                adx_min_trend = 25.0
+
+            # 计算 ATR（Wilder）
+            atr_val = 0.0
+            if len(klines) >= atr_period + 1:
+                highs = np.array([k['high'] for k in klines], dtype=float)
+                lows = np.array([k['low'] for k in klines], dtype=float)
+                closes_arr = np.array([k['close'] for k in klines], dtype=float)
+                prev_closes = np.concatenate(([closes_arr[0]], closes_arr[:-1]))
+                tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_closes), np.abs(lows - prev_closes)))
+                atr = np.zeros_like(tr)
+                atr[atr_period-1] = tr[:atr_period].mean()
+                for i in range(atr_period, len(tr)):
+                    atr[i] = (atr[i-1] * (atr_period - 1) + tr[i]) / atr_period
+                atr_val = float(atr[-1])
+
+            close_price = float(closes[-1])
+            if atr_val > 0 and close_price > 0:
+                atr_ratio = atr_val / close_price
+                if atr_ratio < atr_ratio_thresh:
+                    return {'signal': 'hold', 'reason': f'ATR滤波：波动率低（ATR/收盘={atr_ratio:.4f} < {atr_ratio_thresh}）'}
+
+            # 计算 ADX（Wilder）
+            adx_val = 0.0
+            if len(klines) >= adx_period + 1:
+                highs = np.array([k['high'] for k in klines], dtype=float)
+                lows = np.array([k['low'] for k in klines], dtype=float)
+                closes_arr2 = np.array([k['close'] for k in klines], dtype=float)
+
+                up_move = highs[1:] - highs[:-1]
+                down_move = lows[:-1] - lows[1:]
+                plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+                minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+                prev_closes2 = closes_arr2[:-1]
+                tr2 = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - prev_closes2), np.abs(lows[1:] - prev_closes2)))
+
+                def wilder_smooth(arr, per):
+                    sm = np.zeros_like(arr)
+                    sm[per-1] = arr[:per].sum()
+                    for i in range(per, len(arr)):
+                        sm[i] = sm[i-1] - (sm[i-1] / per) + arr[i]
+                    return sm
+
+                plus_dm_sm = wilder_smooth(plus_dm, adx_period)
+                minus_dm_sm = wilder_smooth(minus_dm, adx_period)
+                tr_sm = wilder_smooth(tr2, adx_period)
+
+                tr_sm_safe = np.where(tr_sm == 0, 1e-12, tr_sm)
+                plus_di = 100.0 * (plus_dm_sm / tr_sm_safe)
+                minus_di = 100.0 * (minus_dm_sm / tr_sm_safe)
+                dx = 100.0 * (np.abs(plus_di - minus_di) / np.maximum(plus_di + minus_di, 1e-12))
+
+                adx = np.zeros_like(dx)
+                adx[adx_period-1] = dx[:adx_period].mean()
+                for i in range(adx_period, len(dx)):
+                    adx[i] = (adx[i-1] * (adx_period - 1) + dx[i]) / adx_period
+                adx_val = float(adx[-1])
+
+            if adx_val > 0 and adx_val < adx_min_trend:
+                return {'signal': 'hold', 'reason': f'ADX滤波：趋势不足（ADX={adx_val:.1f} < {adx_min_trend}）'}
+
             # 使用实时K线：当前与前一根（不等待收盘）
             macd_current = self.calculate_macd(closes)
             macd_prev = self.calculate_macd(closes[:-1])
             
             # 获取持仓（强制刷新，确保信号判断基于最新持仓）
             position = self.get_position(symbol, force_refresh=True)
+            try:
+                logger.debug(f"📏 {symbol} ATR={atr_val:.6f}, ATR/Close={atr_val/close_price:.6f} | ADX={adx_val:.2f}")
+            except Exception:
+                pass
+            # 可选：在日志里输出ATR/ADX，用于回溯
+            try:
+                logger.debug(f"📏 {symbol} ATR({atr_period})={atr_val:.6f}, ATR/Close={atr_val/close_price:.6f} | ADX({adx_period})={adx_val:.2f}")
+            except Exception:
+                pass
             
             # 使用实时K线进行交叉与柱状图颜色变化判断
             prev_macd = macd_prev['macd']
@@ -1024,34 +1315,33 @@ class MACDStrategy:
             
             # 生成交易信号
             if position['size'] == 0:  # 无持仓
-                # 金叉信号：快线上穿慢线 或 柱状图由绿转红（负到正）
-                if (prev_macd <= prev_signal and current_macd > current_signal) or (prev_hist <= 0 and current_hist > 0):
-                    return {'signal': 'buy', 'reason': 'MACD金叉（快线上穿慢线）'}
-                
-                # 死叉信号：快线下穿慢线 或 柱状图由红转绿（正到负）
-                elif (prev_macd >= prev_signal and current_macd < current_signal) or (prev_hist >= 0 and current_hist < 0):
-                    return {'signal': 'sell', 'reason': 'MACD死叉（快线下穿慢线）'}
-                
+                # 双确认开仓：交叉 + 柱状图跨零变色（减少频繁交易）
+                buy_cross = (prev_macd <= prev_signal and current_macd > current_signal)
+                buy_color = (prev_hist <= 0 and current_hist > 0)
+                sell_cross = (prev_macd >= prev_signal and current_macd < current_signal)
+                sell_color = (prev_hist >= 0 and current_hist < 0)
+
+                if buy_cross and buy_color:
+                    return {'signal': 'buy', 'reason': '双确认：金叉 + 柱状图由负转正'}
+                elif sell_cross and sell_color:
+                    return {'signal': 'sell', 'reason': '双确认：死叉 + 柱状图由正转负'}
                 else:
-                    return {'signal': 'hold', 'reason': '等待交叉信号'}
+                    return {'signal': 'hold', 'reason': '等待双确认信号'}
             
             else:  # 有持仓
                 current_position_side = position['side']
                 
-                # 检查持仓方向是否与上次记录一致，如果一致说明没有平仓过
-                last_side = self.last_position_state.get(symbol, 'none')
-                
                 if current_position_side == 'long':
-                    # 多头平仓：快线下穿慢线 或 柱状图转负
-                    if (prev_macd >= prev_signal and current_macd < current_signal) or (current_hist < 0):
-                        return {'signal': 'close', 'reason': '多头平仓（死叉）'}
+                    # 多头双确认平仓：死叉且柱状图为负
+                    if (prev_macd >= prev_signal and current_macd < current_signal) and (current_hist < 0):
+                        return {'signal': 'close', 'reason': '多头双确认平仓：死叉且柱状图为负'}
                     else:
                         return {'signal': 'hold', 'reason': '持有多头'}
                 
                 else:  # short
-                    # 空头平仓：快线上穿慢线 或 柱状图转正
-                    if (prev_macd <= prev_signal and current_macd > current_signal) or (current_hist > 0):
-                        return {'signal': 'close', 'reason': '空头平仓（金叉）'}
+                    # 空头双确认平仓：金叉且柱状图为正
+                    if (prev_macd <= prev_signal and current_macd > current_signal) and (current_hist > 0):
+                        return {'signal': 'close', 'reason': '空头双确认平仓：金叉且柱状图为正'}
                     else:
                         return {'signal': 'hold', 'reason': '持有空头'}
                         
@@ -1062,7 +1352,7 @@ class MACDStrategy:
     def execute_strategy(self):
         """执行策略"""
         logger.info("=" * 70)
-        logger.info("🚀 开始执行MACD策略 (分币种杠杆，15分钟周期)")
+        logger.info("🚀 开始执行MACD策略 (分币种杠杆，5分钟周期)")
         logger.info("=" * 70)
         
         try:
@@ -1107,6 +1397,32 @@ class MACDStrategy:
                 # 获取当前持仓（强制刷新，确保动作基于最新状态）
                 current_position = self.get_position(symbol, force_refresh=True)
                 
+                # 优先进行 SL/TP 检查与跟踪止损更新（触发则直接平仓，不反手）
+                try:
+                    kl = self.get_klines(symbol, 50)
+                    if kl:
+                        close_price = float(kl[-1]['close'])
+                        atr_p = int((os.environ.get('ATR_PERIOD') or '14').strip())
+                        atr_val = self.calculate_atr(kl, atr_p)
+                        if current_position and current_position.get('size', 0) > 0 and atr_val > 0:
+                            self._update_trailing_stop(symbol, close_price, atr_val, current_position.get('side', 'long'))
+                            st = self.sl_tp_state.get(symbol)
+                            if st:
+                                if current_position.get('side') == 'long':
+                                    if close_price <= st['sl'] or close_price >= st['tp']:
+                                        logger.info(f"⛔ 触发SL/TP多头 {symbol}: 价={close_price:.6f} SL={st['sl']:.6f} TP={st['tp']:.6f}")
+                                        self.close_position(symbol, open_reverse=False)
+                                        current_position = self.get_position(symbol, force_refresh=True)
+                                        continue
+                                else:  # short
+                                    if close_price >= st['sl'] or close_price <= st['tp']:
+                                        logger.info(f"⛔ 触发SL/TP空头 {symbol}: 价={close_price:.6f} SL={st['sl']:.6f} TP={st['tp']:.6f}")
+                                        self.close_position(symbol, open_reverse=False)
+                                        current_position = self.get_position(symbol, force_refresh=True)
+                                        continue
+                except Exception:
+                    pass
+                
                 if signal == 'buy':
                     # 检查是否已经是多头持仓，如果是则不重复开仓
                     if current_position['size'] > 0 and current_position['side'] == 'long':
@@ -1149,7 +1465,7 @@ class MACDStrategy:
         logger.info("🚀 MACD策略启动 - RAILWAY平台版 (小币种)")
         logger.info("=" * 70)
         logger.info(f"📈 MACD参数: 快线={self.fast_period}, 慢线={self.slow_period}, 信号线={self.signal_period}")
-        logger.info(f"📊 K线周期: {self.timeframe} (15分钟)")
+        logger.info(f"📊 K线周期: {self.timeframe} (5分钟)")
         lev_desc = ', '.join([f"{s.split('/')[0]}={self.symbol_leverage.get(s, 20)}x" for s in self.symbols])
         logger.info(f"💪 杠杆倍数: {lev_desc}")
         logger.info("⏰ 刷新方式: 实时巡检（每interval秒执行一次，可用环境变量 SCAN_INTERVAL 调整，默认1秒）")
