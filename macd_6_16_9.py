@@ -1109,6 +1109,13 @@ class MACDStrategy:
             inst_id = self.symbol_to_inst_id(symbol)
             if not inst_id or entry_price <= 0 or atr_val <= 0 or side not in ('long', 'short'):
                 return False
+            # 获取当前持仓数量用于 sz（OKX要求 sz 或 closeFraction）
+            pos = self.get_position(symbol, force_refresh=True)
+            size = float(pos.get('size', 0) or 0)
+            if size <= 0:
+                logger.warning(f"⚠️ 无有效持仓数量，跳过挂TP/SL {symbol}")
+                return False
+
             n = float(self.atr_sl_n); m = float(self.atr_tp_m)
             if side == 'long':
                 sl_trigger = entry_price - n * atr_val
@@ -1120,12 +1127,15 @@ class MACDStrategy:
                 tp_trigger = entry_price - m * atr_val
                 ord_side = 'buy'
                 pos_side = 'short'
+
             params = {
                 'instId': inst_id,
                 'tdMode': 'cross',
                 'posSide': pos_side,
                 'side': ord_side,
                 'ordType': 'oco',
+                'reduceOnly': True,
+                'sz': f"{size}",
                 'tpTriggerPx': f"{tp_trigger}",
                 'tpOrdPx': '-1',
                 'slTriggerPx': f"{sl_trigger}",
@@ -1135,11 +1145,11 @@ class MACDStrategy:
             ok = False
             if isinstance(resp, dict):
                 code = str(resp.get('code', ''))
-                ok = (code == '0' or code == '200' or resp.get('data'))
+                ok = (code == '0' or code == '200' or (resp.get('data') and not code or code == '0'))
             else:
                 ok = bool(resp)
             if ok:
-                logger.info(f"📌 交易所侧TP/SL已挂 {symbol}: TP@{tp_trigger:.6f} SL@{sl_trigger:.6f}")
+                logger.info(f"📌 交易所侧TP/SL已挂 {symbol}: size={size:.6f} TP@{tp_trigger:.6f} SL@{sl_trigger:.6f}")
                 return True
             else:
                 logger.warning(f"⚠️ 交易所侧TP/SL挂单失败 {symbol}: {resp}")
