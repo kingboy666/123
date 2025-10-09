@@ -400,10 +400,13 @@ class MACDStrategy:
                     atr_val = self.calculate_atr(kl, atr_p) if kl else 0.0
                     entry = float(position.get('entry_price', 0) or 0)
                     if atr_val > 0 and entry > 0:
-                        self.place_okx_tp_sl(symbol, entry, position.get('side', 'long'), atr_val)
-                        logger.info(f"📌 已为已有持仓补挂TP/SL {symbol}")
+                        okx_ok = self.place_okx_tp_sl(symbol, entry, position.get('side', 'long'), atr_val)
+                        if okx_ok:
+                            logger.info(f"📌 已为已有持仓补挂TP/SL {symbol}")
+                        else:
+                            logger.warning(f"⚠️ 补挂交易所侧TP/SL失败 {symbol}")
                 except Exception as _e:
-                    logger.warning(f"⚠️ 补挂交易所侧TP/SL失败 {symbol}: {_e}")
+                    logger.warning(f"⚠️ 补挂交易所侧TP/SL异常 {symbol}: {_e}")
                     has_positions = True
                 else:
                     self.last_position_state[symbol] = 'none'
@@ -875,11 +878,11 @@ class MACDStrategy:
                         st = self.sl_tp_state.get(symbol)
                         if st:
                             logger.info(f"🎯 初始化SL/TP {symbol}: SL={st['sl']:.6f}, TP={st['tp']:.6f} (N={self.atr_sl_n}, M={self.atr_tp_m}, ATR={atr_val:.6f})")
-                            try:
-                                self.place_okx_tp_sl(symbol, float(pos.get('entry_price', 0) or 0), pos.get('side', 'long'), atr_val)
+                            okx_ok = self.place_okx_tp_sl(symbol, float(pos.get('entry_price', 0) or 0), pos.get('side', 'long'), atr_val)
+                            if okx_ok:
                                 logger.info(f"📌 已在交易所侧挂TP/SL {symbol}")
-                            except Exception as _e:
-                                logger.warning(f"⚠️ 挂交易所侧TP/SL失败 {symbol}: {_e}")
+                            else:
+                                logger.warning(f"⚠️ 交易所侧TP/SL挂单失败 {symbol}")
                 except Exception:
                     pass
                 return True
@@ -1100,6 +1103,51 @@ class MACDStrategy:
             logger.warning(f"⚠️ 交易所侧TP/SL挂单失败 {symbol}: {e}")
             return False
 
+    def place_okx_tp_sl(self, symbol: str, entry_price: float, side: str, atr_val: float) -> bool:
+        """在OKX侧同时挂TP/SL条件单；posSide=long→side='sell'，posSide=short→side='buy'；执行价用市价(-1)"""
+        try:
+            inst_id = self.symbol_to_inst_id(symbol)
+            if not inst_id or entry_price <= 0 or atr_val <= 0 or side not in ('long', 'short'):
+                return False
+            n = float(self.atr_sl_n); m = float(self.atr_tp_m)
+            if side == 'long':
+                sl_trigger = entry_price - n * atr_val
+                tp_trigger = entry_price + m * atr_val
+                ord_side = 'sell'
+                pos_side = 'long'
+            else:
+                sl_trigger = entry_price + n * atr_val
+                tp_trigger = entry_price - m * atr_val
+                ord_side = 'buy'
+                pos_side = 'short'
+            params = {
+                'instId': inst_id,
+                'tdMode': 'cross',
+                'posSide': pos_side,
+                'side': ord_side,
+                'ordType': 'oco',
+                'tpTriggerPx': f"{tp_trigger}",
+                'tpOrdPx': '-1',
+                'slTriggerPx': f"{sl_trigger}",
+                'slOrdPx': '-1',
+            }
+            resp = self.exchange.privatePostTradeOrderAlgo(params)
+            ok = False
+            if isinstance(resp, dict):
+                code = str(resp.get('code', ''))
+                ok = (code == '0' or code == '200' or resp.get('data'))
+            else:
+                ok = bool(resp)
+            if ok:
+                logger.info(f"📌 交易所侧TP/SL已挂 {symbol}: TP@{tp_trigger:.6f} SL@{sl_trigger:.6f}")
+                return True
+            else:
+                logger.warning(f"⚠️ 交易所侧TP/SL挂单失败 {symbol}: {resp}")
+                return False
+        except Exception as e:
+            logger.warning(f"⚠️ 交易所侧TP/SL挂单异常 {symbol}: {e}")
+            return False
+
     def calculate_atr(self, klines: List[Dict], period: int = 14) -> float:
         """计算 ATR（Wilder），返回最新值；klines需含 high/low/close，按时间升序"""
         try:
@@ -1245,7 +1293,7 @@ class MACDStrategy:
             if atr_val > 0 and close_price > 0:
                 atr_ratio = atr_val / close_price
                 if atr_ratio < atr_ratio_thresh:
-                    return {'signal': 'hold', 'reason': f'ATR滤波：波动率低（ATR/收盘={atr_ratio:.4f} < {atr_ratio_thresh}）'}
+                    logger.debug(f"ATR滤波提示：波动率低（ATR/收盘={atr_ratio:.4f} < {atr_ratio_thresh}），不拦截信号")
 
             # 计算 ADX（Wilder）
             adx_val = 0.0
@@ -1285,7 +1333,7 @@ class MACDStrategy:
                 adx_val = float(adx[-1])
 
             if adx_val > 0 and adx_val < adx_min_trend:
-                return {'signal': 'hold', 'reason': f'ADX滤波：趋势不足（ADX={adx_val:.1f} < {adx_min_trend}）'}
+                logger.debug(f"ADX滤波提示：趋势不足（ADX={adx_val:.1f} < {adx_min_trend}），不拦截信号")
 
             # 使用实时K线：当前与前一根（不等待收盘）
             macd_current = self.calculate_macd(closes)
