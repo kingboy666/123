@@ -186,6 +186,12 @@ class MACDStrategy:
         
         # 市场信息缓存
         self.markets_info: Dict[str, Dict[str, Any]] = {}
+        # API 速率限制（节流器）：默认最小间隔 0.2s，可用 OKX_API_MIN_INTERVAL 覆盖
+        self._last_api_ts: float = 0.0
+        try:
+            self._min_api_interval: float = float((os.environ.get('OKX_API_MIN_INTERVAL') or '0.2').strip())
+        except Exception:
+            self._min_api_interval = 0.2
         
         # 交易统计
         self.stats = TradingStats()
@@ -391,6 +397,37 @@ class MACDStrategy:
             return True
         except Exception as e:
             logger.error(f"❌ 批量取消订单失败: {e}")
+            return False
+
+    def cancel_symbol_tp_sl(self, symbol: str) -> bool:
+        """撤销该交易对在OKX侧已挂的TP/SL（OCO）条件单"""
+        try:
+            inst_id = self.symbol_to_inst_id(symbol)
+            if not inst_id:
+                return True
+            # 查询待触发的条件单（OCO）
+            resp = self.exchange.privateGetTradeOrdersAlgoPending({'instType': 'SWAP', 'instId': inst_id})
+            data = resp.get('data') if isinstance(resp, dict) else resp
+            algo_ids = []
+            for it in (data or []):
+                try:
+                    if (it.get('ordType') or '').lower() == 'oco':
+                        aid = it.get('algoId') or it.get('algoID') or it.get('id')
+                        if aid:
+                            algo_ids.append({'algoId': str(aid), 'instId': inst_id})
+                except Exception:
+                    continue
+            if not algo_ids:
+                return True
+            # 撤销OCO（OKX规范是传对象数组；若失败，降级为兼容形式）
+            try:
+                self.exchange.privatePostTradeCancelAlgos({'algoIds': algo_ids})
+            except Exception:
+                self.exchange.privatePostTradeCancelAlgos({'algoIds': [x['algoId'] for x in algo_ids], 'instId': inst_id})
+            logger.info(f"✅ 撤销 {symbol} 已挂 OCO 条件单数量: {len(algo_ids)}")
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ 撤销 {symbol} 条件单失败: {e}")
             return False
     
     def sync_all_status(self):
@@ -1150,36 +1187,6 @@ class MACDStrategy:
             self.sl_tp_state[symbol] = st
         except Exception:
             pass
-    def place_okx_tp_sl(self, symbol: str, entry_price: float, side: str, atr_val: float):
-        """在OKX侧同时挂TP/SL条件单，执行价为市价(-1)，触发价基于ATR"""
-        try:
-            inst_id = self.symbol_to_inst_id(symbol)
-            n = float(self.atr_sl_n); m = float(self.atr_tp_m)
-            if side == 'long':
-                sl_trigger = entry_price - n * atr_val
-                tp_trigger = entry_price + m * atr_val
-                pos_side = 'long'
-            else:
-                sl_trigger = entry_price + n * atr_val
-                tp_trigger = entry_price - m * atr_val
-                pos_side = 'short'
-            params = {
-                'instId': inst_id,
-                'tdMode': 'cross',
-                'posSide': pos_side,
-                'ordType': 'oco',  # 同时挂TP/SL
-                'tpTriggerPx': f"{tp_trigger}",
-                'tpOrdPx': '-1',   # 市价
-                'slTriggerPx': f"{sl_trigger}",
-                'slOrdPx': '-1',   # 市价
-            }
-            resp = self.exchange.privatePostTradeOrderAlgo(params)
-            logger.info(f"📌 交易所侧TP/SL已挂 {symbol}: TP@{tp_trigger:.6f} SL@{sl_trigger:.6f}")
-            return True
-        except Exception as e:
-            logger.warning(f"⚠️ 交易所侧TP/SL挂单失败 {symbol}: {e}")
-            return False
-
     def place_okx_tp_sl(self, symbol: str, entry_price: float, side: str, atr_val: float) -> bool:
         """在OKX侧同时挂TP/SL条件单；posSide=long→side='sell'，posSide=short→side='buy'；执行价用市价(-1)"""
         try:
@@ -1376,84 +1383,6 @@ class MACDStrategy:
             if adx_val > 0 and adx_val < adx_min_trend:
                 logger.debug(f"ADX滤波提示：趋势不足（ADX={adx_val:.1f} < {adx_min_trend}），不拦截信号")
 
-            # === ATR/ADX 过滤 ===
-            try:
-                atr_period = int((os.environ.get('ATR_PERIOD') or '14').strip())
-            except Exception:
-                atr_period = 14
-            try:
-                atr_ratio_thresh = float((os.environ.get('ATR_RATIO_THRESH') or '0.004').strip())
-            except Exception:
-                atr_ratio_thresh = 0.004
-            try:
-                adx_period = int((os.environ.get('ADX_PERIOD') or '14').strip())
-            except Exception:
-                adx_period = 14
-            try:
-                adx_min_trend = float((os.environ.get('ADX_MIN_TREND') or '25').strip())
-            except Exception:
-                adx_min_trend = 25.0
-
-            # 计算 ATR（Wilder）
-            atr_val = 0.0
-            if len(klines) >= atr_period + 1:
-                highs = np.array([k['high'] for k in klines], dtype=float)
-                lows = np.array([k['low'] for k in klines], dtype=float)
-                closes_arr = np.array([k['close'] for k in klines], dtype=float)
-                prev_closes = np.concatenate(([closes_arr[0]], closes_arr[:-1]))
-                tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_closes), np.abs(lows - prev_closes)))
-                atr = np.zeros_like(tr)
-                atr[atr_period-1] = tr[:atr_period].mean()
-                for i in range(atr_period, len(tr)):
-                    atr[i] = (atr[i-1] * (atr_period - 1) + tr[i]) / atr_period
-                atr_val = float(atr[-1])
-
-            close_price = float(closes[-1])
-            if atr_val > 0 and close_price > 0:
-                atr_ratio = atr_val / close_price
-                if atr_ratio < atr_ratio_thresh:
-                    logger.debug(f"ATR滤波提示：波动率低（ATR/收盘={atr_ratio:.4f} < {atr_ratio_thresh}），不拦截信号")
-
-            # 计算 ADX（Wilder）
-            adx_val = 0.0
-            if len(klines) >= adx_period + 1:
-                highs = np.array([k['high'] for k in klines], dtype=float)
-                lows = np.array([k['low'] for k in klines], dtype=float)
-                closes_arr2 = np.array([k['close'] for k in klines], dtype=float)
-
-                up_move = highs[1:] - highs[:-1]
-                down_move = lows[:-1] - lows[1:]
-                plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-                minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-                prev_closes2 = closes_arr2[:-1]
-                tr2 = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - prev_closes2), np.abs(lows[1:] - prev_closes2)))
-
-                def wilder_smooth(arr, per):
-                    sm = np.zeros_like(arr)
-                    sm[per-1] = arr[:per].sum()
-                    for i in range(per, len(arr)):
-                        sm[i] = sm[i-1] - (sm[i-1] / per) + arr[i]
-                    return sm
-
-                plus_dm_sm = wilder_smooth(plus_dm, adx_period)
-                minus_dm_sm = wilder_smooth(minus_dm, adx_period)
-                tr_sm = wilder_smooth(tr2, adx_period)
-
-                tr_sm_safe = np.where(tr_sm == 0, 1e-12, tr_sm)
-                plus_di = 100.0 * (plus_dm_sm / tr_sm_safe)
-                minus_di = 100.0 * (minus_dm_sm / tr_sm_safe)
-                dx = 100.0 * (np.abs(plus_di - minus_di) / np.maximum(plus_di + minus_di, 1e-12))
-
-                adx = np.zeros_like(dx)
-                adx[adx_period-1] = dx[:adx_period].mean()
-                for i in range(adx_period, len(dx)):
-                    adx[i] = (adx[i-1] * (adx_period - 1) + dx[i]) / adx_period
-                adx_val = float(adx[-1])
-
-            if adx_val > 0 and adx_val < adx_min_trend:
-                logger.debug(f"ADX滤波提示：趋势不足（ADX={adx_val:.1f} < {adx_min_trend}），不拦截信号")
-
             # 使用实时K线：当前与前一根（不等待收盘） - 支持分币种MACD参数
             _p = getattr(self, 'per_symbol_params', {}).get(symbol, {})
             _macd = _p.get('macd') if isinstance(_p, dict) else None
@@ -1532,6 +1461,17 @@ class MACDStrategy:
             logger.error(f"❌ 分析{symbol}失败: {e}")
             return {'signal': 'hold', 'reason': f'分析异常: {e}'}
     
+    def _throttle(self):
+        """简单节流：控制最小 API 调用间隔，保护速率限制"""
+        try:
+            now = time.time()
+            wait = self._min_api_interval - (now - self._last_api_ts)
+            if wait and wait > 0:
+                time.sleep(wait)
+            self._last_api_ts = time.time()
+        except Exception:
+            pass
+
     def execute_strategy(self):
         """执行策略"""
         logger.info("=" * 70)
@@ -1601,6 +1541,14 @@ class MACDStrategy:
                                             st['sl'] = max(st['sl'], close_price - 1.2 * atr_val) if current_position.get('side') == 'long' else min(st['sl'], close_price + 1.2 * atr_val)
                                 except Exception:
                                     pass
+                                try:
+                                    # 动态止盈收紧后，撤旧重挂交易所侧TP/SL
+                                    self.okx_tp_sl_placed[symbol] = False
+                                    self.cancel_symbol_tp_sl(symbol)
+                                    self.place_okx_tp_sl(symbol, entry_px, current_position.get('side', 'long'), atr_val)
+                                    logger.info(f"🔁 更新追踪止盈：已撤旧单并重挂 {symbol}")
+                                except Exception as _e:
+                                    logger.warning(f"⚠️ 更新追踪止盈重挂失败 {symbol}: {_e}")
                                 if current_position.get('side') == 'long':
                                     if close_price <= st['sl'] or close_price >= st['tp']:
                                         logger.info(f"⛔ 触发SL/TP多头 {symbol}: 价={close_price:.6f} SL={st['sl']:.6f} TP={st['tp']:.6f}")
@@ -1740,7 +1688,7 @@ def main():
         # 运行策略（扫描间隔可通过环境变量 SCAN_INTERVAL 覆盖，单位秒，默认1s）
         try:
             scan_interval_env = os.environ.get('SCAN_INTERVAL', '').strip()
-            scan_interval = int(scan_interval_env) if scan_interval_env else 1
+            scan_interval = int(scan_interval_env) if scan_interval_env else 2
             if scan_interval <= 0:
                 scan_interval = 1
         except Exception:
