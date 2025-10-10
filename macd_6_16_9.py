@@ -1203,6 +1203,13 @@ class MACDStrategy:
                 logger.warning(f"⚠️ 无有效持仓数量，跳过挂TP/SL {symbol}")
                 return False
 
+            # 撤销已挂的TP/SL条件单，避免重复残留
+            try:
+                self.cancel_symbol_tp_sl(symbol)
+                time.sleep(0.3)  # 节流，避免与后续下单竞态
+            except Exception:
+                pass
+
             n = float(self.atr_sl_n); m = float(self.atr_tp_m)
             if side == 'long':
                 sl_trigger = entry_price - n * atr_val
