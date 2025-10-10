@@ -1207,6 +1207,34 @@ class MACDStrategy:
                 tp_trigger = entry_price - m * atr_val
                 ord_side = 'buy'
                 pos_side = 'short'
+            
+            # 钳制触发价：基于最新价方向校验，并按 tick 对齐，避免 51280 风控错误
+            try:
+                last_price = 0.0
+                tkr = self.exchange.publicGetMarketTicker({'instId': inst_id})
+                if isinstance(tkr, dict):
+                    d = tkr.get('data') or []
+                    if isinstance(d, list) and d:
+                        last_price = float(d[0].get('last') or d[0].get('lastPx') or 0.0)
+                price_prec = int(self.markets_info.get(symbol, {}).get('price_precision', 4))
+                tick = 10 ** (-price_prec)
+                min_gap = max(0.001 * last_price, 5 * tick) if last_price > 0 else 5 * tick
+                if last_price > 0:
+                    if side == 'long':
+                        # 多头：SL < last，TP > last
+                        sl_trigger = min(sl_trigger, last_price - min_gap)
+                        tp_trigger = max(tp_trigger, last_price + min_gap)
+                        # 步进对齐（保持方向约束）
+                        sl_trigger = math.floor(sl_trigger / tick) * tick
+                        tp_trigger = math.ceil(tp_trigger / tick) * tick
+                    else:
+                        # 空头：SL > last，TP < last
+                        sl_trigger = max(sl_trigger, last_price + min_gap)
+                        tp_trigger = min(tp_trigger, last_price - min_gap)
+                        sl_trigger = math.ceil(sl_trigger / tick) * tick
+                        tp_trigger = math.floor(tp_trigger / tick) * tick
+            except Exception:
+                pass
 
             params = {
                 'instId': inst_id,
