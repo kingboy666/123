@@ -8,7 +8,7 @@
 ### 📈 交易策略
 - **MACD(6,32,9)** 技术指标
 - **ADX** 趋势强度识别
-- **30分钟** 时间框架
+- **15分钟** 时间框架
 - 金叉做多，死叉平仓（做空相反）
 
 ### 🛡️ 风险管理
@@ -52,9 +52,9 @@
 1. Fork 本仓库
 2. 连接到 Railway
 3. 设置环境变量：
-   - `API_KEY`: 交易所API密钥
-   - `SECRET_KEY`: 交易所密钥
-   - `PASSPHRASE`: API密码（如需要）
+   - `OKX_API_KEY`: 交易所API密钥
+   - `OKX_SECRET_KEY`: 交易所密钥
+   - `OKX_PASSPHRASE`: API密码（如需要）
 4. 部署运行
 
 ### 本地运行
@@ -63,7 +63,7 @@
 pip install -r requirements.txt
 
 # 运行机器人
-python main.py
+python macd_6_16_9.py
 ```
 
 ## 环境变量配置
@@ -74,16 +74,58 @@ OKX_API_KEY=your_api_key
 OKX_SECRET_KEY=your_secret_key
 OKX_PASSPHRASE=your_passphrase
 
-# 可选配置
+# 可选配置（运行与风控）
 # 每次扫描的时间间隔（秒）。为 1 表示每秒刷新。已在部署配置中默认设为 1。
 SCAN_INTERVAL=1
-
 # 仅用 OKX 原生接口，避免 ccxt 统一接口在部分路由上的拼接错误
 USE_OKX_NATIVE_ONLY=1
-
 # 每币最低 USDT 成本下限（避免连手续费都不够），可按需调整
 PER_SYMBOL_MIN_USDT=5
+
+# ATR/ADX 策略参数（可选）
+ATR_SL_N=2.0
+ATR_TP_M=3.0
+ATR_PERIOD=14
+ATR_RATIO_THRESH=0.004
+ADX_PERIOD=14
+ADX_MIN_TREND=25
+
+# 资金分配与下单（可选）
+# 固定每次名义下单金额（U），若设置则优先使用该金额
+TARGET_NOTIONAL_USDT=
+# 分配模式：all（默认，均分余额）或 signals（只给有信号的币分配）
+ALLOC_MODE=all
+# 下单名义金额放大因子，例如 50 表示余额/分母后再乘以 50
+ORDER_NOTIONAL_FACTOR=50
+# 单币下单金额下限与上限（U）
+MIN_PER_SYMBOL_USDT=
+MAX_PER_SYMBOL_USDT=
+
+# 运行时 Python 版本固定（建议）
+PYTHON_VERSION=3.11.9
 ```
+
+### 快速配置清单（Railway Variables）
+- 必填
+  - OKX_API_KEY
+  - OKX_SECRET_KEY
+  - OKX_PASSPHRASE
+- 可选
+  - SCAN_INTERVAL（默认 1）
+  - USE_OKX_NATIVE_ONLY（默认 1）
+  - PER_SYMBOL_MIN_USDT（默认 5）
+  - ATR_SL_N（默认 2.0）
+  - ATR_TP_M（默认 3.0）
+  - ATR_PERIOD（默认 14）
+  - ATR_RATIO_THRESH（默认 0.004）
+  - ADX_PERIOD（默认 14）
+  - ADX_MIN_TREND（默认 25）
+  - TARGET_NOTIONAL_USDT（固定每次名义下单金额，留空表示不用）
+  - ALLOC_MODE（all/signals，默认 all）
+  - ORDER_NOTIONAL_FACTOR（默认 50）
+  - MIN_PER_SYMBOL_USDT（下限，留空表示不用）
+  - MAX_PER_SYMBOL_USDT（上限，留空表示不用）
+  - PYTHON_VERSION（建议 3.11.9，用于固定运行环境）
 
 ## 安全特性
 
