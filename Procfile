@@ -1,1 +1,1 @@
-worker: bash -lc 'export SCAN_INTERVAL=1 USE_OKX_NATIVE_ONLY=1 PER_SYMBOL_MIN_USDT=5 && python main.py'
+worker: bash -lc 'export SCAN_INTERVAL=3 USE_OKX_NATIVE_ONLY=1 PER_SYMBOL_MIN_USDT=5 OKX_API_MIN_INTERVAL=0.6 && python main.py'
