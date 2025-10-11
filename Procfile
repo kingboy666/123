@@ -1,1 +1,1 @@
-start: python -u "11交易对/main.py"
+worker: bash -lc 'export SCAN_INTERVAL=1 USE_OKX_NATIVE_ONLY=1 PER_SYMBOL_MIN_USDT=5 && python main.py'

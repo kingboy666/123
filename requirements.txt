@@ -1,4 +1,6 @@
-ccxt>=4.3.41
-pandas>=2.2.2
-numpy>=2.0.0
-pytz>=2024.1
+pandas==2.2.1
+numpy==1.26.4
+requests==2.31.0
+urllib3==2.1.0
+ccxt==4.3.94
+pytz==2024.1
