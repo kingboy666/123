@@ -1,1 +1,1 @@
-worker: python -u main.py
+start: python -u "11交易对/main.py"
